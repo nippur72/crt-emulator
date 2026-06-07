@@ -1,0 +1,38 @@
+{
+  "name": "@nippur72/crt-emulator",
+  "version": "1.0.0",
+  "description": "CRT screen emulation (old color TV set) class written in TypeScript and WebGL",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepare": "npm run build"
+  },
+  "keywords": [
+    "crt",
+    "emulator",
+    "webgl",
+    "scanlines",
+    "retro",
+    "shader",
+    "canvas",
+    "tv"
+  ],
+  "author": "nippur72",
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}
