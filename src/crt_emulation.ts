@@ -129,14 +129,11 @@ interface CRTEmulatorUniforms {
 }
 
 /**
- * Returns the GLSL source code for the fragment shader.
+ * The GLSL source code for the fragment shader.
  * The shader performs CRT warping, scanline synthesis, RGB shadow mask application,
  * and PAL composite signal chroma bleed emulation.
- *
- * @returns The GLSL ES 1.0 fragment shader source string.
  */
-function fsCRTSource(): string {
-   return `
+const fsCRTSource = `
       #extension GL_OES_standard_derivatives : enable
       precision highp float;
       varying vec2 vTexCoord;
@@ -333,7 +330,6 @@ function fsCRTSource(): string {
          gl_FragColor = vec4(ToSrgb(color), 1.0);
       }
    `;
-}
 
 /**
  * Controller class to handle WebGL lifecycle and rendering for CRT simulation.
@@ -406,7 +402,7 @@ export class CRTEmulator {
          };
 
          const vs = loadShader(gl.VERTEX_SHADER, vsSource);
-         const fsCRT = loadShader(gl.FRAGMENT_SHADER, fsCRTSource());
+         const fsCRT = loadShader(gl.FRAGMENT_SHADER, fsCRTSource);
 
          if (!vs || !fsCRT) return false;
 
