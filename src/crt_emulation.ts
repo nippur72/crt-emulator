@@ -353,6 +353,9 @@ export class CRTEmulator {
     */
    public useWebGL = false;
 
+   private resizeObserver: ResizeObserver | null = null;
+   private resizeListener: (() => void) | null = null;
+
    /**
     * Creates an instance of CRTEmulator.
     * @param canvas The target HTML canvas to render the CRT effect onto.
@@ -540,5 +543,67 @@ export class CRTEmulator {
       gl.vertexAttribPointer(aTexCoordLoc, 2, gl.FLOAT, false, 16, 8);
 
       gl.drawArrays(gl.TRIANGLES, 0, 6);
+   }
+
+   /**
+    * Triggers a manual canvas resize based on its client bounding rect and device pixel ratio.
+    * Uses provided parameters as fallbacks if the canvas is not yet attached to the DOM.
+    *
+    * @param fallbackWidth Optional fallback width in pixels if the canvas rect width is 0.
+    * @param fallbackHeight Optional fallback height in pixels if the canvas rect height is 0.
+    */
+   public resize(fallbackWidth?: number, fallbackHeight?: number): void {
+      if (!this.canvas) return;
+      const rect = this.canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      const width = Math.round(rect.width * dpr) || fallbackWidth || this.canvas.width;
+      const height = Math.round(rect.height * dpr) || fallbackHeight || this.canvas.height;
+
+      if (this.canvas.width !== width || this.canvas.height !== height) {
+         this.canvas.width = width;
+         this.canvas.height = height;
+      }
+   }
+
+   /**
+    * Configures an automatic resize observer for the canvas. It will also perform
+    * the initial resize synchronously during this call.
+    *
+    * @param getFallbackDimensions Optional callback returning fallback width and height.
+    */
+   public setupResizeObserver(getFallbackDimensions?: () => { width: number; height: number }): void {
+      if (typeof window === 'undefined') return;
+
+      const runResize = () => {
+         const fallback = getFallbackDimensions ? getFallbackDimensions() : undefined;
+         this.resize(fallback?.width, fallback?.height);
+      };
+
+      if (typeof ResizeObserver !== 'undefined') {
+         if (!this.resizeObserver) {
+            this.resizeObserver = new ResizeObserver(runResize);
+            this.resizeObserver.observe(this.canvas);
+         }
+      } else if (!this.resizeListener) {
+         this.resizeListener = runResize;
+         window.addEventListener('resize', this.resizeListener);
+      }
+
+      // Perform the initial resize synchronously
+      runResize();
+   }
+
+   /**
+    * Cleans up observers and listeners to prevent memory leaks.
+    */
+   public destroy(): void {
+      if (this.resizeObserver) {
+         this.resizeObserver.disconnect();
+         this.resizeObserver = null;
+      }
+      if (this.resizeListener) {
+         window.removeEventListener('resize', this.resizeListener);
+         this.resizeListener = null;
+      }
    }
 }
