@@ -135,7 +135,7 @@ interface CRTEmulatorUniforms {
  *
  * @returns The GLSL ES 1.0 fragment shader source string.
  */
-export function fsCRTSource(): string {
+function fsCRTSource(): string {
    return `
       #extension GL_OES_standard_derivatives : enable
       precision highp float;

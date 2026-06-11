@@ -90,9 +90,6 @@ Uploads the raw image data to the GPU and renders it to the viewport with the CR
 | `gapWidth` | `number` | `0.25` | Vertical dark gap width between phosphors. |
 | `gapHeight` | `number` | `0.5` | Horizontal dark gap height between phosphors. |
 
-### `fsCRTSource(): string`
-Helper function that returns the raw GLSL fragment shader source code, which can be useful if you're integrating this shader into your own custom WebGL pipeline.
-
 ## License
 
 MIT
