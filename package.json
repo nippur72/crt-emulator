@@ -32,6 +32,17 @@
   ],
   "author": "nippur72",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nippur72/crt-emulator.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nippur72/crt-emulator/issues"
+  },
+  "homepage": "https://github.com/nippur72/crt-emulator#readme",
+  "publishConfig": {
+    "access": "public"
+  },
   "devDependencies": {
     "typescript": "^5.0.0"
   }
