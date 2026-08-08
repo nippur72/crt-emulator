@@ -88,6 +88,14 @@ export interface CRTEmulatorOptions {
     * @default 0.5
     */
    gapHeight?: number;
+
+   /**
+    * Dynamic mask fading factor on bright pixels.
+    * - 0.0 = No fading (constant mask strength)
+    * - 1.0 = Max fading (mask disappears entirely on white pixels)
+    * @default 0.3
+    */
+   maskFade?: number;
 }
 
 /**
@@ -106,6 +114,7 @@ const DEFAULT_OPTIONS: Required<CRTEmulatorOptions> = {
    maskHeight: 6.0,
    gapWidth: 0.25,
    gapHeight: 0.5,
+   maskFade: 0.9,
 };
 
 /**
@@ -126,6 +135,7 @@ interface CRTEmulatorUniforms {
    uMaskHeight: WebGLUniformLocation | null;
    uGapWidth: WebGLUniformLocation | null;
    uGapHeight: WebGLUniformLocation | null;
+   uMaskFade: WebGLUniformLocation | null;
 }
 
 /**
@@ -152,6 +162,7 @@ const fsCRTSource = `
       uniform float uMaskHeight;
       uniform float uGapWidth;
       uniform float uGapHeight;
+      uniform float uMaskFade;
 
       // sRGB to Linear.
       // Assuming using sRGB typed textures this should not be needed.
@@ -326,7 +337,16 @@ const fsCRTSource = `
 
       void main(void) {
          vec2 pos = Warp(vTexCoord);
-         vec3 color = Tri(pos) * Mask(pos * uResolution);
+         vec3 rawColor = Tri(pos);
+         vec3 maskVal = Mask(pos * uResolution);
+         
+         // Calculate luminance using standard weights
+         float luma = dot(rawColor, vec3(0.299, 0.587, 0.114));
+         
+         // Fade the mask towards 1.0 (white/no mask) on bright areas
+         vec3 dynamicMask = mix(maskVal, vec3(1.0), luma * uMaskFade);
+         
+         vec3 color = rawColor * dynamicMask;
          gl_FragColor = vec4(ToSrgb(color), 1.0);
       }
    `;
@@ -440,6 +460,7 @@ export class CRTEmulator {
             uMaskHeight: gl.getUniformLocation(this.glProgramCRT, "uMaskHeight"),
             uGapWidth: gl.getUniformLocation(this.glProgramCRT, "uGapWidth"),
             uGapHeight: gl.getUniformLocation(this.glProgramCRT, "uGapHeight"),
+            uMaskFade: gl.getUniformLocation(this.glProgramCRT, "uMaskFade"),
          };
 
          // Setup vertices quad (two triangles covering the full viewport)
@@ -525,6 +546,7 @@ export class CRTEmulator {
       gl.uniform1f(this.uniforms.uMaskHeight, opt.maskHeight);
       gl.uniform1f(this.uniforms.uGapWidth, opt.gapWidth);
       gl.uniform1f(this.uniforms.uGapHeight, opt.gapHeight);
+      gl.uniform1f(this.uniforms.uMaskFade, opt.maskFade);
 
       const aPositionLoc = gl.getAttribLocation(this.glProgramCRT, "aPosition");
       const aTexCoordLoc = gl.getAttribLocation(this.glProgramCRT, "aTexCoord");
