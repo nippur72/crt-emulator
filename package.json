@@ -1,6 +1,6 @@
 {
   "name": "@nippur72/crt-emulator",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "CRT screen emulation (old color TV set) class written in TypeScript and WebGL",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -18,7 +18,8 @@
   ],
   "scripts": {
     "build": "tsc",
-    "prepare": "npm run build"
+    "prepare": "npm run build",
+    "demo": "http-server . -p 8080 -c-1"
   },
   "keywords": [
     "crt",
@@ -44,6 +45,7 @@
     "access": "public"
   },
   "devDependencies": {
+    "http-server": "^14.1.1",
     "typescript": "^5.0.0"
   }
 }

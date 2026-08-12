@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>CRT Emulator — composite chroma demo</title>
+<style>
+  body { background:#151515; color:#ccc; font-family: ui-monospace, monospace; margin:20px; }
+  h3 { margin: 0 0 8px 0; }
+  canvas { display:block; border:1px solid #333; }
+  #controls { margin-top:12px; line-height:1.9; }
+  #controls label { display:inline-block; width:150px; }
+  #controls input[type=range] { vertical-align:middle; width:200px; }
+  #controls input[type=checkbox] { vertical-align:middle; }
+  code { background:#222; padding:1px 5px; border-radius:3px; }
+  #pastezone {
+    margin-top:12px; padding:8px 12px; border:1px dashed #555; background:#1b1b1b;
+    color:#999; display:flex; align-items:center; gap:10px;
+  }
+  #pastezone.has { border-color:#6a9; color:#9bc; }
+  #pastesrc { flex:1; }
+  #pastezone button {
+    background:#2a2a2a; color:#ccc; border:1px solid #555; padding:4px 10px; cursor:pointer;
+  }
+  #pastezone button:hover { background:#333; }
+</style>
+</head>
+<body>
+<h3>CRT emulator — composite chroma demo (C64-like 320&#215;200)</h3>
+<canvas id="screen" width="960" height="600"></canvas>
+<div id="controls">
+  <div><label>chromaBleed</label><input id="bleed" type="range" min="0" max="4" step="0.1" value="2"><span id="bleedv"></span></div>
+  <div><label>chromaPhase</label><input id="phase" type="range" min="0" max="1" step="0.01" value="0.5"><span id="phasev"></span> (0.5 = NTSC, 0.625 = PAL)</div>
+  <div><label>chromaCrosstalk</label><input id="xtalk" type="range" min="0" max="1" step="0.05" value="0.5"><span id="xtalkv"></span></div>
+  <div><label>maskScale</label><input id="mask" type="range" min="0.5" max="3" step="0.05" value="1.25"><span id="maskv"></span></div>
+  <div><label>warp</label><input id="warp" type="range" min="0" max="0.12" step="0.005" value="0.04"><span id="warpv"></span></div>
+  <div><label><input id="double" type="checkbox"> double scanlines</label></div>
+</div>
+<div id="pastezone" title="Focus this page and press Ctrl+V">
+  <span id="pastesrc">Click the page and press Ctrl+V to paste a screen copied from an emulator</span>
+  <button id="reset" type="button">reset demo frame</button>
+</div>
+<script type="module">
+import { CRTEmulator } from "../dist/index.js";
+
+const W = 320, H = 200;
+const canvas = document.getElementById("screen");
+
+// --- build a C64-like 320x200 source frame ---------------------------------
+const PAL = ["#000000","#FFFFFF","#880000","#AAFFEE","#CC44CC","#00CC55",
+             "#0000AA","#EEEE77","#DD8855","#664400","#FF7777","#333333",
+             "#777777","#AAFF66","#0088FF","#BBBBBB"];
+
+function buildDemoFrame() {
+  const off = document.createElement("canvas");
+  off.width = W; off.height = H;
+  const octx = off.getContext("2d");
+
+  // border (C64 blue)
+  octx.fillStyle = PAL[6]; octx.fillRect(0, 0, W, H);
+
+  // saturated colour bars (sharp vertical edges)
+  const barW = W / 8;
+  const barCols = [2, 4, 5, 7, 14, 3, 13, 10];
+  for (let i = 0; i < 8; i++) {
+    octx.fillStyle = PAL[barCols[i]];
+    octx.fillRect(i * barW, 20, barW, 52);
+  }
+
+  // white text on blue — the classic fringing test case
+  octx.fillStyle = PAL[1];
+  octx.font = "bold 19px monospace";
+  octx.textBaseline = "top";
+  octx.fillText("COMPOSITE VIDEO", 18, 88);
+  octx.fillText("FRINGING TEST 320x200", 18, 110);
+
+  // checkerboard of complementary colours
+  for (let y = 138; y < 188; y += 16) {
+    for (let x = 0; x < W; x += 16) {
+      octx.fillStyle = ((x / 16 + y / 16) % 2 === 0) ? PAL[4] : PAL[3];
+      octx.fillRect(x, y, 16, 16);
+    }
+  }
+
+  return octx.getImageData(0, 0, W, H);
+}
+const demoFrame = buildDemoFrame();
+
+// --- current source: the demo frame until the user pastes something --------
+let cur = { img: demoFrame, w: W, h: H, label: "demo frame 320×200" };
+
+// resize the on-screen canvas to keep the pasted image's aspect ratio
+function fitCanvas(w, h) {
+  const maxW = 960, maxH = 600;
+  const scale = Math.min(maxW / w, maxH / h);
+  const cw = Math.round(w * scale), ch = Math.round(h * scale);
+  if (canvas.width !== cw || canvas.height !== ch) {
+    canvas.width = cw; canvas.height = ch;
+  }
+}
+
+// --- paste a screen copied from an emulator --------------------------------
+const zone = document.getElementById("pastezone");
+const zoneMsg = document.getElementById("pastesrc");
+
+document.addEventListener("paste", (e) => {
+  const items = e.clipboardData ? [...e.clipboardData.items] : [];
+  const item = items.find((i) => i.type.startsWith("image/"));
+  if (!item) return; // not an image — let the browser handle it
+  e.preventDefault();
+  const file = item.getAsFile();
+  if (!file) return;
+  createImageBitmap(file).then((bmp) => {
+    try {
+      // keep very large screenshots manageable for the shader
+      const maxW = 1024, maxH = 768;
+      const scale = Math.min(1, maxW / bmp.width, maxH / bmp.height);
+      const w = Math.max(1, Math.round(bmp.width * scale));
+      const h = Math.max(1, Math.round(bmp.height * scale));
+      const c = document.createElement("canvas");
+      c.width = w; c.height = h;
+      const cctx = c.getContext("2d");
+      cctx.drawImage(bmp, 0, 0, w, h);
+      cur = { img: cctx.getImageData(0, 0, w, h), w, h, label: `${file.name || "pasted screen"} ${w}×${h}` };
+      fitCanvas(w, h);
+      zone.classList.add("has");
+      zoneMsg.textContent = cur.label + " — press Ctrl+V again to replace, or reset below";
+    } finally {
+      bmp.close();
+    }
+  }).catch((err) => {
+    console.error(err);
+    zoneMsg.textContent = "paste failed — is it an image?";
+  });
+});
+
+function resetFrame() {
+  cur = { img: demoFrame, w: W, h: H, label: "demo frame 320×200" };
+  fitCanvas(W, H);
+  zone.classList.remove("has");
+  zoneMsg.textContent = "Click the page and press Ctrl+V to paste a screen copied from an emulator";
+}
+document.getElementById("reset").addEventListener("click", resetFrame);
+
+// --- optionally double rows (matching the emulator's doubleScanlines) -------
+function doubled(img) {
+  const d = new ImageData(W, H * 2);
+  for (let y = 0; y < H * 2; y++) {
+    d.data.set(img.data.subarray((y >> 1) * W * 4, ((y >> 1) + 1) * W * 4), y * W * 4);
+  }
+  return d;
+}
+
+// --- set up the emulator ----------------------------------------------------
+const crt = new CRTEmulator(canvas);
+crt.init();
+
+const el = (id) => document.getElementById(id);
+const labels = { bleed: "bleedv", phase: "phasev", xtalk: "xtalkv", mask: "maskv", warp: "warpv" };
+for (const [id, span] of Object.entries(labels)) {
+  el(span).textContent = el(id).value;
+  el(id).addEventListener("input", () => { el(span).textContent = el(id).value; });
+}
+
+function frame() {
+  const opts = {
+    chromaBleed: parseFloat(el("bleed").value),
+    chromaPhase: parseFloat(el("phase").value),
+    chromaCrosstalk: parseFloat(el("xtalk").value),
+    maskScale: parseFloat(el("mask").value),
+    warp: parseFloat(el("warp").value),
+  };
+  const img = el("double").checked ? doubled(cur.img) : cur.img;
+  crt.render(cur.w, cur.h, el("double").checked, img, opts);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

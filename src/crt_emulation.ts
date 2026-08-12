@@ -1,6 +1,7 @@
 /**
  * Original shader taken from https://www.shadertoy.com/view/XsjSzR
- * Improved with a better RGB mask and PAL colour bleed simulation.
+ * Improved with a better RGB mask and a composite-video chroma simulation
+ * (band-limited colour bleed + luma-to-chroma crosstalk fringing).
  */
 
 /**
@@ -56,14 +57,40 @@ export interface CRTEmulatorOptions {
    maskScale?: number;
 
    /**
-    * Chroma (color) bleed simulation level.
-    * Simulates signal bleeding common in composite PAL video connections.
+    * Chroma (color) bleed radius, in source pixels (texels).
+    * The TV receiver's chroma path has much less bandwidth than its luma path,
+    * so colour detail smears horizontally across roughly this many source pixels
+    * while luminance stays sharp. At 320-pixel-wide 8-bit output (e.g. C64)
+    * a radius of ~1.5-3.0 reproduces the classic composite look.
     * - 0.0 = None (perfect RGB signal)
-    * - 1.0 = Normal PAL bleed
-    * - 2.0 = Strong PAL bleed
-    * @default 1.0
+    * - 1.0 = Mild bleed
+    * - 2.0 = Normal composite bleed (C64-like)
+    * - 3.0+ = Strong bleed
+    * @default 2.0
     */
    chromaBleed?: number;
+
+   /**
+    * Colour subcarrier phase advance, in cycles per source pixel (texel).
+    * This is the ratio of the colour subcarrier frequency to the pixel clock,
+    * which drives the hue of the luma-to-chroma crosstalk fringes.
+    * - 0.0    = No phase effect (plain symmetric smear)
+    * - 0.5    = NTSC (C64 US: 3.58 MHz subcarrier / 7.16 MHz pixel clock)
+    * - 0.625  = PAL (C64 EU: 4.43 MHz subcarrier / 7.09 MHz pixel clock)
+    * @default 0.5
+    */
+   chromaPhase?: number;
+
+   /**
+    * Luma-to-chroma crosstalk level (0.0 - 1.0).
+    * Sharp luminance edges (e.g. text) contain energy at the colour subcarrier
+    * frequency; a real TV decodes this as spurious colour, producing the
+    * characteristic rainbow/colour fringing on high-contrast edges.
+    * - 0.0 = No fringing
+    * - 0.5 = Strong fringing (C64-like)
+    * @default 0.5
+    */
+   chromaCrosstalk?: number;
 
    /**
     * Horizontal period/width of the RGB triad element in pixels.
@@ -109,7 +136,9 @@ const DEFAULT_OPTIONS: Required<CRTEmulatorOptions> = {
    maskDark: 0.5,
    maskLight: 1.0,
    maskScale: 1.25,
-   chromaBleed: 1.0,
+   chromaBleed: 2.0,
+   chromaPhase: 0.5,
+   chromaCrosstalk: 0.5,
    maskWidth: 3.0,
    maskHeight: 6.0,
    gapWidth: 0.25,
@@ -131,6 +160,8 @@ interface CRTEmulatorUniforms {
    uMaskLight: WebGLUniformLocation | null;
    uMaskScale: WebGLUniformLocation | null;
    uChromaBleed: WebGLUniformLocation | null;
+   uChromaPhase: WebGLUniformLocation | null;
+   uChromaCrosstalk: WebGLUniformLocation | null;
    uMaskWidth: WebGLUniformLocation | null;
    uMaskHeight: WebGLUniformLocation | null;
    uGapWidth: WebGLUniformLocation | null;
@@ -158,6 +189,8 @@ const fsCRTSource = `
       uniform float uMaskLight;
       uniform float uMaskScale;
       uniform float uChromaBleed;
+      uniform float uChromaPhase;
+      uniform float uChromaCrosstalk;
       uniform float uMaskWidth;
       uniform float uMaskHeight;
       uniform float uGapWidth;
@@ -203,24 +236,87 @@ const fsCRTSource = `
       vec3 Fetch(vec2 pos, vec2 off) {
          vec2 texCoord = (floor(pos * uTextureResolution + off) + vec2(0.5)) / uTextureResolution;
          if (max(abs(texCoord.x - 0.5), abs(texCoord.y - 0.5)) > 0.5) return vec3(0.0, 0.0, 0.0);
-         
-         vec3 rgbCenter = ToLinear(texture2D(uSampler, texCoord).rgb);
-         if (uChromaBleed <= 0.0) return rgbCenter;
-         
-         vec2 texCoordLeft = (floor(pos * uTextureResolution + off + vec2(-uChromaBleed, 0.0)) + vec2(0.5)) / uTextureResolution;
-         vec2 texCoordRight = (floor(pos * uTextureResolution + off + vec2(uChromaBleed, 0.0)) + vec2(0.5)) / uTextureResolution;
-         
-         vec3 rgbLeft = ToLinear(texture2D(uSampler, texCoordLeft).rgb);
-         vec3 rgbRight = ToLinear(texture2D(uSampler, texCoordRight).rgb);
-         
-         vec3 yuvCenter = RGBtoYUV(rgbCenter);
-         vec3 yuvLeft = RGBtoYUV(rgbLeft);
-         vec3 yuvRight = RGBtoYUV(rgbRight);
-         
-         float avgU = (yuvLeft.y + yuvCenter.y + yuvRight.y) / 3.0;
-         float avgV = (yuvLeft.z + yuvCenter.z + yuvRight.z) / 3.0;
-         
-         return YUVtoRGB(vec3(yuvCenter.x, avgU, avgV));
+         return ToLinear(texture2D(uSampler, texCoord).rgb);
+      }
+
+      // ----------------------------------------------------------------------
+      // Composite-video chroma simulation.
+      // Models the chroma path of a PAL/NTSC receiver along the scanline:
+      //   1) chroma low-pass filtering  -> colour bleeding/smearing
+      //   2) luma-to-chroma crosstalk    -> rainbow fringing on sharp edges
+      // Keeps the sharp resampled luminance and replaces the chroma only.
+      // ----------------------------------------------------------------------
+      vec3 ApplyComposite(vec3 sharpColor, vec2 pos) {
+         // Fractional source-texel position of this output pixel
+         vec2 center = pos * uTextureResolution;
+         float cx = center.x;
+         float cy = floor(center.y) + 0.5;
+
+         // Window radius and Gaussian sigma, in source texels.
+         // A minimum 1.5-texel window is kept so the crosstalk can see edges
+         // even when uChromaBleed is 0.
+         float radius = max(uChromaBleed, 1.5);
+         float sigma = max(uChromaBleed, 0.001) * 0.55;
+
+         // Subcarrier phase advance per source texel, in radians.
+         float phaseStep = 6.28318530718 * uChromaPhase;
+         // Reference phase: continuous across the scanline plus the ~180 deg
+         // line-to-line alternation common to NTSC and PAL colour frames.
+         float refPhase = phaseStep * cx + 3.14159265358979 * mod(floor(center.y), 2.0);
+
+         // Bilinearly sampled centre luma (the crosstalk reference)
+         vec2 uvCenter = vec2(clamp(cx / uTextureResolution.x, 0.0, 1.0), clamp(cy / uTextureResolution.y, 0.0, 1.0));
+         float yCenter = RGBtoYUV(ToLinear(texture2D(uSampler, uvCenter).rgb)).x;
+
+         vec2 chroma = vec2(0.0);
+         vec2 fringe = vec2(0.0);
+         float lumaAvg = 0.0;
+         float sumW = 0.0;
+
+         // Constant loop bounds are required by GLSL ES 1.00 (WebGL 1).
+         // Taps outside the requested radius are skipped.
+         for (int i = 0; i <= 10; i++) {
+            float d = float(i) - 5.0;
+            if (abs(d) > radius) continue;
+
+            vec2 uv = vec2(clamp((cx + d) / uTextureResolution.x, 0.0, 1.0), uvCenter.y);
+            vec3 yuv = RGBtoYUV(ToLinear(texture2D(uSampler, uv).rgb));
+
+            // Band-limit the chroma: colour bleeds across the window.
+            // A small negative lobe (Gaussian minus a narrower Gaussian)
+            // reproduces the mild chroma ringing/overshoot real composite
+            // decoders show at colour transitions.
+            float w = exp(-0.5 * (d / sigma) * (d / sigma))
+                    - 0.5 * exp(-0.5 * (d / (sigma * 0.5)) * (d / (sigma * 0.5)));
+            chroma += w * yuv.yz;
+            lumaAvg += w * yuv.x;
+
+            // Luma-to-chroma crosstalk: luma deviation demodulated against the
+            // colour subcarrier. The hue follows the (locked) subcarrier phase,
+            // producing the alternating rainbow fringes seen on composite video.
+            float ph = refPhase + phaseStep * d;
+            fringe += w * (yuv.x - yCenter) * vec2(cos(ph), sin(ph));
+            sumW += w;
+         }
+         chroma /= max(sumW, 1e-6);
+         fringe /= max(sumW, 1e-6);
+         lumaAvg /= max(sumW, 1e-6);
+
+         // Keep the sharp luminance from the resampler; replace the chroma with
+         // the band-limited version and add the crosstalk fringes.
+         vec3 yuvSharp = RGBtoYUV(sharpColor);
+
+         // The sharp luminance already carries the scanline/resampling
+         // modulation from Tri(); apply the same factor to the window chroma
+         // so flat areas keep a consistent brightness.
+         float mod = yuvSharp.x / max(lumaAvg, 1e-4);
+         mod = clamp(mod, 0.0, 4.0);
+
+         vec2 composite = (chroma + uChromaCrosstalk * fringe) * mod;
+         vec2 finalChroma = (uChromaBleed > 0.0)
+            ? composite
+            : yuvSharp.yz + uChromaCrosstalk * fringe * mod;
+         return YUVtoRGB(vec3(yuvSharp.x, finalChroma));
       }
 
       // Distance in emulated pixels to nearest texel.
@@ -338,6 +434,12 @@ const fsCRTSource = `
       void main(void) {
          vec2 pos = Warp(vTexCoord);
          vec3 rawColor = Tri(pos);
+
+         // Composite chroma processing (bleed + fringing), one pass per pixel.
+         if (uChromaBleed > 0.0 || uChromaCrosstalk > 0.0) {
+            rawColor = ApplyComposite(rawColor, pos);
+         }
+
          vec3 maskVal = Mask(pos * uResolution);
          
          // Calculate luminance using standard weights
@@ -456,6 +558,8 @@ export class CRTEmulator {
             uMaskLight: gl.getUniformLocation(this.glProgramCRT, "uMaskLight"),
             uMaskScale: gl.getUniformLocation(this.glProgramCRT, "uMaskScale"),
             uChromaBleed: gl.getUniformLocation(this.glProgramCRT, "uChromaBleed"),
+            uChromaPhase: gl.getUniformLocation(this.glProgramCRT, "uChromaPhase"),
+            uChromaCrosstalk: gl.getUniformLocation(this.glProgramCRT, "uChromaCrosstalk"),
             uMaskWidth: gl.getUniformLocation(this.glProgramCRT, "uMaskWidth"),
             uMaskHeight: gl.getUniformLocation(this.glProgramCRT, "uMaskHeight"),
             uGapWidth: gl.getUniformLocation(this.glProgramCRT, "uGapWidth"),
@@ -542,6 +646,8 @@ export class CRTEmulator {
       gl.uniform1f(this.uniforms.uMaskLight, opt.maskLight);
       gl.uniform1f(this.uniforms.uMaskScale, opt.maskScale);
       gl.uniform1f(this.uniforms.uChromaBleed, opt.chromaBleed);
+      gl.uniform1f(this.uniforms.uChromaPhase, opt.chromaPhase);
+      gl.uniform1f(this.uniforms.uChromaCrosstalk, opt.chromaCrosstalk);
       gl.uniform1f(this.uniforms.uMaskWidth, opt.maskWidth);
       gl.uniform1f(this.uniforms.uMaskHeight, opt.maskHeight);
       gl.uniform1f(this.uniforms.uGapWidth, opt.gapWidth);
