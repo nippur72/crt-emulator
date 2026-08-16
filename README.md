@@ -40,6 +40,24 @@ in `src/crt_emulation.ts`.
   edges contain energy at the subcarrier frequency; a real TV decodes this as spurious
   colour, producing the alternating rainbow fringes on text and high-contrast edges.
 
+## Interactive Control Panel
+
+You can open a floating, draggable parameters window at any time by calling `window.crt_emulator()` in the console or from code:
+
+```ts
+// Opens the draggable parameters panel
+window.crt_emulator();
+
+// Or with initial values and a real-time change callback:
+window.crt_emulator(currentOptions, (newOptions) => {
+  // update rendering options
+});
+```
+
+- **Draggable**: Drag the title bar to reposition anywhere on screen.
+- **Always on top**: Floats above your application content.
+- **Console output**: When closed, the current parameter object is printed to the console as JSON for easy copy-pasting.
+
 ## Demo
 
 Run `npm run demo` from the repository root and open http://localhost:8080/demo/.

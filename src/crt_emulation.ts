@@ -129,7 +129,7 @@ export interface CRTEmulatorOptions {
  * Default options applied when rendering if no custom options are provided,
  * or used to fill in missing properties in user-supplied options.
  */
-const DEFAULT_OPTIONS: Required<CRTEmulatorOptions> = {
+export const DEFAULT_OPTIONS: Required<CRTEmulatorOptions> = {
    hardScan: -6.0,
    hardPix: -2.0,
    warp: 0.04,

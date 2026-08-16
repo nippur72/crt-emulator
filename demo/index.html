@@ -34,6 +34,9 @@
   <div><label>maskScale</label><input id="mask" type="range" min="0.5" max="3" step="0.05" value="1.25"><span id="maskv"></span></div>
   <div><label>warp</label><input id="warp" type="range" min="0" max="0.12" step="0.005" value="0.04"><span id="warpv"></span></div>
   <div><label><input id="double" type="checkbox"> double scanlines</label></div>
+  <div style="margin-top:8px;">
+    <button id="open-window-btn" type="button" style="background:#3a3a4c; color:#eee; border:1px solid #666; padding:5px 12px; border-radius:4px; cursor:pointer; font-family:inherit;">Open CRT Parameters Window (window.crt_emulator())</button>
+  </div>
 </div>
 <div id="pastezone" title="Focus this page and press Ctrl+V">
   <span id="pastesrc">Click the page and press Ctrl+V to paste a screen copied from an emulator</span>
@@ -158,19 +161,61 @@ const el = (id) => document.getElementById(id);
 const labels = { bleed: "bleedv", phase: "phasev", xtalk: "xtalkv", mask: "maskv", warp: "warpv" };
 for (const [id, span] of Object.entries(labels)) {
   el(span).textContent = el(id).value;
-  el(id).addEventListener("input", () => { el(span).textContent = el(id).value; });
+  el(id).addEventListener("input", () => {
+    el(span).textContent = el(id).value;
+    if (activeGuiHandle) {
+      activeGuiHandle.setOptions(getCurrentPageOpts());
+    }
+  });
 }
 
-function frame() {
-  const opts = {
+function getCurrentPageOpts() {
+  return {
     chromaBleed: parseFloat(el("bleed").value),
     chromaPhase: parseFloat(el("phase").value),
     chromaCrosstalk: parseFloat(el("xtalk").value),
     maskScale: parseFloat(el("mask").value),
     warp: parseFloat(el("warp").value),
   };
+}
+
+let activeGuiHandle = null;
+let currentCustomOptions = getCurrentPageOpts();
+
+window.addEventListener("crt-emulator:change", (e) => {
+  currentCustomOptions = e.detail;
+  // Update on-page sliders if they exist
+  if (e.detail.chromaBleed !== undefined && el("bleed")) {
+    el("bleed").value = e.detail.chromaBleed;
+    el("bleedv").textContent = e.detail.chromaBleed;
+  }
+  if (e.detail.chromaPhase !== undefined && el("phase")) {
+    el("phase").value = e.detail.chromaPhase;
+    el("phasev").textContent = e.detail.chromaPhase;
+  }
+  if (e.detail.chromaCrosstalk !== undefined && el("xtalk")) {
+    el("xtalk").value = e.detail.chromaCrosstalk;
+    el("xtalkv").textContent = e.detail.chromaCrosstalk;
+  }
+  if (e.detail.maskScale !== undefined && el("mask")) {
+    el("mask").value = e.detail.maskScale;
+    el("maskv").textContent = e.detail.maskScale;
+  }
+  if (e.detail.warp !== undefined && el("warp")) {
+    el("warp").value = e.detail.warp;
+    el("warpv").textContent = e.detail.warp;
+  }
+});
+
+document.getElementById("open-window-btn").addEventListener("click", () => {
+  activeGuiHandle = window.crt_emulator(currentCustomOptions, (opts) => {
+    currentCustomOptions = opts;
+  });
+});
+
+function frame() {
   const img = el("double").checked ? doubled(cur.img) : cur.img;
-  crt.render(cur.w, cur.h, el("double").checked, img, opts);
+  crt.render(cur.w, cur.h, el("double").checked, img, currentCustomOptions);
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
