@@ -1,6 +1,6 @@
 {
   "name": "@nippur72/crt-emulator",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "CRT screen emulation (old color TV set) class written in TypeScript and WebGL",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
