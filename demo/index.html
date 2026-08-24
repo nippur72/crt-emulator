@@ -36,6 +36,8 @@
   <div><label>convergence</label><input id="conv" type="range" min="0" max="3" step="0.05" value="0"><span id="convv"></span></div>
   <div><label>vignette</label><input id="vig" type="range" min="0" max="1" step="0.01" value="0"><span id="vigv"></span></div>
   <div><label>jitter</label><input id="jit" type="range" min="0" max="3" step="0.05" value="0"><span id="jitv"></span></div>
+  <div><label>persistence</label><input id="pers" type="range" min="0" max="0.95" step="0.01" value="0"><span id="persv"></span></div>
+  <div><label>bloom</label><input id="bloom" type="range" min="0" max="1" step="0.01" value="0"><span id="bloomv"></span></div>
   <div><label>maskType</label>
     <select id="mtype">
       <option value="slot">slot</option>
@@ -169,7 +171,7 @@ const crt = new CRTEmulator(canvas);
 crt.init();
 
 const el = (id) => document.getElementById(id);
-const labels = { bleed: "bleedv", phase: "phasev", xtalk: "xtalkv", mask: "maskv", warp: "warpv", conv: "convv", vig: "vigv", jit: "jitv" };
+const labels = { bleed: "bleedv", phase: "phasev", xtalk: "xtalkv", mask: "maskv", warp: "warpv", conv: "convv", vig: "vigv", jit: "jitv", pers: "persv", bloom: "bloomv" };
 for (const [id, span] of Object.entries(labels)) {
   el(span).textContent = el(id).value;
   el(id).addEventListener("input", () => {
@@ -190,6 +192,8 @@ function getCurrentPageOpts() {
     convergence: parseFloat(el("conv").value),
     vignette: parseFloat(el("vig").value),
     jitter: parseFloat(el("jit").value),
+    persistence: parseFloat(el("pers").value),
+    bloom: parseFloat(el("bloom").value),
     maskType: el("mtype").value,
   };
 }
@@ -214,6 +218,8 @@ window.addEventListener("crt-emulator:change", (e) => {
   syncNum("convergence", "conv", "convv");
   syncNum("vignette", "vig", "vigv");
   syncNum("jitter", "jit", "jitv");
+  syncNum("persistence", "pers", "persv");
+  syncNum("bloom", "bloom", "bloomv");
   if (e.detail.maskType !== undefined && el("mtype")) {
     el("mtype").value = e.detail.maskType;
   }

@@ -158,6 +158,24 @@ export interface CRTEmulatorOptions {
     * @default "slot"
     */
    maskType?: "slot" | "grille" | "delta";
+
+   /**
+    * Phosphor persistence / afterglow level (0.0 - 0.95).
+    * Bright areas fade out gradually instead of disappearing instantly,
+    * like a real tube's phosphor decay. Requires a multipass render path;
+    * 0 keeps the fast single-pass path.
+    * @default 0.0
+    */
+   persistence?: number;
+
+   /**
+    * Bloom / glow strength (0.0 - 1.0).
+    * Bright areas bleed a soft halo onto the surrounding screen, caused by
+    * electron beam spread and glass reflections. Requires a multipass
+    * render path; 0 keeps the fast single-pass path.
+    * @default 0.0
+    */
+   bloom?: number;
 }
 
 /**
@@ -183,6 +201,8 @@ export const DEFAULT_OPTIONS: Required<CRTEmulatorOptions> = {
    vignette: 0.0,
    jitter: 0.0,
    maskType: "slot",
+   persistence: 0.0,
+   bloom: 0.0,
 };
 
 /**
@@ -217,11 +237,10 @@ interface CRTEmulatorUniforms {
 }
 
 /**
- * The GLSL source code for the fragment shader.
- * The shader performs CRT warping, scanline synthesis, RGB shadow mask application,
- * and PAL composite signal chroma bleed emulation.
+ * Shared GLSL library used by every fragment program: gamma helpers, YUV
+ * conversion, resampler, composite chroma path, warp and shadow mask.
  */
-const fsCRTSource = `
+const fsLibSource = `
       precision highp float;
       varying vec2 vTexCoord;
       uniform sampler2D uSampler;
@@ -528,7 +547,13 @@ const fsCRTSource = `
          }
          return mix(mask, maskAvg, blend);
       }
+   `;
 
+/**
+ * Legacy single-pass program: complete CRT image in one draw.
+ * Kept bit-identical to the pre-multipass behaviour.
+ */
+const fsCRTSource = fsLibSource + `
       void main(void) {
          vec2 pos = Warp(vTexCoord);
 
@@ -578,6 +603,194 @@ const fsCRTSource = `
    `;
 
 /**
+ * Multipass "scene" program: everything up to and including the composite
+ * chroma path, output in linear light WITHOUT mask/vignette/gamma.
+ */
+const fsSceneSource = fsLibSource + `
+      void main(void) {
+         vec2 pos = Warp(vTexCoord);
+
+         if (uJitter > 0.0) {
+            float lineIdx = floor(pos.y * uTextureResolution.y);
+            pos.x += (hash11(lineIdx + floor(uTime * 13.0)) - 0.5) * uJitter / uResolution.x;
+         }
+
+         vec3 rawColor;
+         if (uConvergence > 0.0) {
+            float conv = uConvergence / uResolution.x;
+            float r = Tri(vec2(pos.x - conv, pos.y)).r;
+            float g = Tri(pos).g;
+            float b = Tri(vec2(pos.x + conv, pos.y)).b;
+            rawColor = vec3(r, g, b);
+         } else {
+            rawColor = Tri(pos);
+         }
+
+         if (uChromaBleed > 0.0 || uChromaCrosstalk > 0.0) {
+            rawColor = ApplyComposite(rawColor, pos);
+         }
+
+         gl_FragColor = vec4(rawColor, 1.0);
+      }
+   `;
+
+/**
+ * Multipass "present" program: mask + vignette + bloom add + gamma encode.
+ */
+const fsPresentSource = fsLibSource + `
+      uniform sampler2D uScene;      // linear-light scene (post-chroma)
+      uniform sampler2D uBloom;      // blurred bright pass (linear light)
+      uniform float uBloomAmount;
+
+      // Shadow mask.
+      // uMaskType: 0 = slot (staggered slots), 1 = grille (vertical stripes),
+      // 2 = delta (triads with per-row rotating RGB order).
+      vec3 Mask(vec2 pos) {
+         pos = pos / uMaskScale;
+
+#ifdef HAS_DERIVATIVES
+         vec2 d = fwidth(pos);
+         float maxD = max(d.x / uMaskWidth, d.y / uMaskHeight);
+         float blend = smoothstep(0.3, 0.8, maxD);
+#else
+         float blend = 0.0;
+#endif
+
+         // Calculate average mask color
+         float activeArea = (uMaskWidth - uGapWidth) * (uMaskHeight - uGapHeight) / (uMaskWidth * uMaskHeight);
+         vec3 maskAvg = activeArea * vec3((uMaskLight + 2.0 * uMaskDark) / 3.0) + (1.0 - activeArea) * vec3(uMaskDark);
+
+         // Aperture grille: vertical stripes only, no row gaps, no stagger.
+         if (uMaskType == 1) {
+            float xModG = mod(pos.x, uMaskWidth);
+            float subW = (uMaskWidth - uGapWidth) / 3.0;
+            vec3 m = vec3(uMaskDark);
+            if (xModG < subW) {
+               m.r = uMaskLight;
+            } else if (xModG < 2.0 * subW) {
+               m.g = uMaskLight;
+            } else {
+               m.b = uMaskLight;
+            }
+            return mix(m, maskAvg, blend);
+         }
+
+         // Stagger every other column of the mask grid.
+         float col = floor(pos.x / uMaskWidth);
+         float y = pos.y + mod(col, 2.0) * (uMaskHeight / 2.0);
+
+         // Delta-gun: no full-width horizontal gap rows; the RGB order rotates
+         // every triad row so neighbouring rows are offset by one phosphor.
+         float rowIdx = floor(y / uMaskHeight);
+         float channelShift = (uMaskType == 2) ? mod(rowIdx, 3.0) : 0.0;
+
+         // Horizontal dark row gap (modulus check)
+         float yMod = mod(y, uMaskHeight);
+         if (uMaskType != 2 && yMod >= (uMaskHeight - uGapHeight)) {
+            return mix(vec3(uMaskDark), maskAvg, blend);
+         }
+
+         // Vertical dark column gap (modulus check)
+         float xMod = mod(pos.x, uMaskWidth);
+         if (xMod >= (uMaskWidth - uGapWidth)) {
+            return mix(vec3(uMaskDark), maskAvg, blend);
+         }
+
+         // Active triad subpixel calculation
+         float activeWidth = uMaskWidth - uGapWidth;
+         float subpixelWidth = activeWidth / 3.0;
+
+         vec3 mask = vec3(uMaskDark);
+         int slot;
+         if (xMod < subpixelWidth) {
+            slot = 0;
+         } else if (xMod < 2.0 * subpixelWidth) {
+            slot = 1;
+         } else {
+            slot = 2;
+         }
+         slot = int(mod(float(slot + int(channelShift)), 3.0));
+         if (slot == 0) {
+            mask.r = uMaskLight;
+         } else if (slot == 1) {
+            mask.g = uMaskLight;
+         } else {
+            mask.b = uMaskLight;
+         }
+         return mix(mask, maskAvg, blend);
+      }
+
+      void main(void) {
+         vec2 pos = Warp(vTexCoord);
+
+         vec3 sceneLinear = texture2D(uScene, vTexCoord).rgb;
+         vec3 bloom = texture2D(uBloom, vTexCoord).rgb;
+
+         vec3 rawColor = sceneLinear + uBloomAmount * bloom;
+
+         vec3 maskVal = Mask(pos * uResolution);
+         float luma = dot(rawColor, vec3(0.299, 0.587, 0.114));
+         vec3 dynamicMask = mix(maskVal, vec3(1.0), luma * uMaskFade);
+         vec3 color = rawColor * dynamicMask;
+
+         if (uVignette > 0.0) {
+            float r2 = length((pos - 0.5) * vec2(1.25, 1.0)) * 1.4;
+            color *= 1.0 - uVignette * pow(clamp(r2, 0.0, 1.0), 2.5);
+         }
+         gl_FragColor = vec4(ToSrgb(color), 1.0);
+      }
+   `;
+
+/**
+ * Persistence accumulation program: accum = max(cur, prev * decay).
+ * Runs in linear light on ping-pong buffers.
+ */
+const fsAccumSource = `
+      precision highp float;
+      varying vec2 vTexCoord;
+      uniform sampler2D uCur;
+      uniform sampler2D uPrev;
+      uniform float uDecay;
+
+      void main(void) {
+         vec3 cur = texture2D(uCur, vTexCoord).rgb;
+         vec3 prev = texture2D(uPrev, vTexCoord).rgb;
+         gl_FragColor = vec4(max(cur, prev * uDecay), 1.0);
+      }
+   `;
+
+/** Bloom bright-pass: keeps energy above a linear threshold. */
+const fsBrightPassSource = `
+      precision highp float;
+      varying vec2 vTexCoord;
+      uniform sampler2D uTex;
+
+      void main(void) {
+         vec3 c = texture2D(uTex, vTexCoord).rgb;
+         float luma = dot(c, vec3(0.299, 0.587, 0.114));
+         float k = max(luma - 0.7, 0.0) / max(luma, 1e-4);
+         gl_FragColor = vec4(c * k, 1.0);
+      }
+   `;
+
+/** Separable Gaussian blur used by the two bloom blur passes. */
+const fsBlurSource = `
+      precision highp float;
+      varying vec2 vTexCoord;
+      uniform sampler2D uTex;
+      uniform vec2 uTexel;      // 1/resolution along the blur axis
+
+      void main(void) {
+         vec3 sum = texture2D(uTex, vTexCoord).rgb * 0.2270270270;
+         vec2 o1 = uTexel * 1.3846153846;
+         vec2 o2 = uTexel * 3.2307692308;
+         sum += (texture2D(uTex, vTexCoord + o1).rgb + texture2D(uTex, vTexCoord - o1).rgb) * 0.3162162162;
+         sum += (texture2D(uTex, vTexCoord + o2).rgb + texture2D(uTex, vTexCoord - o2).rgb) * 0.1081081081;
+         gl_FragColor = vec4(sum, 1.0);
+      }
+   `;
+
+/**
  * Controller class to handle WebGL lifecycle and rendering for CRT simulation.
  * It expects a canvas element, sets up buffers and shaders, updates textures with input frames,
  * and renders the final frame with retro effects like scanlines and CRT curvature.
@@ -588,6 +801,32 @@ export class CRTEmulator {
    private glVertexBuffer: WebGLBuffer | null = null;
    private glTex: WebGLTexture | null = null;
    private uniforms: CRTEmulatorUniforms | null = null;
+   private hasDerivatives = false;
+
+   // Multipass resources (created lazily when persistence/bloom are used)
+   private progScene: WebGLProgram | null = null;
+   private progPresent: WebGLProgram | null = null;
+   private progAccum: WebGLProgram | null = null;
+   private progBright: WebGLProgram | null = null;
+   private progBlur: WebGLProgram | null = null;
+   private uScene: Record<string, WebGLUniformLocation | null> = {};
+   private uPresent: Record<string, WebGLUniformLocation | null> = {};
+   private uAccum: Record<string, WebGLUniformLocation | null> = {};
+   private uBright: Record<string, WebGLUniformLocation | null> = {};
+   private uBlur: Record<string, WebGLUniformLocation | null> = {};
+   private fboScene: WebGLFramebuffer | null = null;
+   private texScene: WebGLTexture | null = null;
+   private fboAccum: [WebGLFramebuffer | null, WebGLFramebuffer | null] = [null, null];
+   private texAccum: [WebGLTexture | null, WebGLTexture | null] = [null, null];
+   private accumIndex = 0;
+   private fboBloomA: WebGLFramebuffer | null = null;
+   private texBloomA: WebGLTexture | null = null;
+   private fboBloomB: WebGLFramebuffer | null = null;
+   private texBloomB: WebGLTexture | null = null;
+   private bloomSize: [number, number] = [0, 0];
+   private multipassSize: [number, number] = [0, 0];
+   private lastFrameTime = 0;
+   private multipassAvailable = false;
 
    /**
     * True if WebGL was successfully initialized and the emulator can render.
@@ -672,6 +911,22 @@ export class CRTEmulator {
 
          if (!this.glProgramCRT) return false;
 
+         // Multipass programs (used only when persistence/bloom are active).
+         // Created eagerly here so a compile problem surfaces at init, not mid-frame.
+         const mkProg = (fsSource: string): WebGLProgram | null => {
+            const fs = loadShader(gl.FRAGMENT_SHADER, fragmentPrefix + fsSource);
+            if (!fs) return null;
+            return createProgram(vs, fs);
+         };
+         this.progScene = mkProg(fsSceneSource);
+         this.progPresent = mkProg(fsPresentSource);
+         this.progAccum = mkProg(fsAccumSource);
+         this.progBright = mkProg(fsBrightPassSource);
+         this.progBlur = mkProg(fsBlurSource);
+         this.multipassAvailable =
+            !!this.progScene && !!this.progPresent && !!this.progAccum &&
+            !!this.progBright && !!this.progBlur;
+
          // Cache uniform locations to avoid costly lookups during draw calls
          this.uniforms = {
             uSampler: gl.getUniformLocation(this.glProgramCRT, "uSampler"),
@@ -699,6 +954,47 @@ export class CRTEmulator {
             aPosition: gl.getAttribLocation(this.glProgramCRT, "aPosition"),
             aTexCoord: gl.getAttribLocation(this.glProgramCRT, "aTexCoord"),
          };
+
+         // Cache uniform locations for the multipass programs
+         const loc = (p: WebGLProgram | null, n: string) =>
+            p ? gl.getUniformLocation(p, n) : null;
+         this.uScene = {
+            uSampler: loc(this.progScene, "uSampler"),
+            uResolution: loc(this.progScene, "uResolution"),
+            uTextureResolution: loc(this.progScene, "uTextureResolution"),
+            uHardScan: loc(this.progScene, "uHardScan"),
+            uHardPix: loc(this.progScene, "uHardPix"),
+            uWarp: loc(this.progScene, "uWarp"),
+            uChromaBleed: loc(this.progScene, "uChromaBleed"),
+            uChromaPhase: loc(this.progScene, "uChromaPhase"),
+            uChromaCrosstalk: loc(this.progScene, "uChromaCrosstalk"),
+            uConvergence: loc(this.progScene, "uConvergence"),
+            uJitter: loc(this.progScene, "uJitter"),
+            uTime: loc(this.progScene, "uTime"),
+         };
+         this.uPresent = {
+            uScene: loc(this.progPresent, "uScene"),
+            uBloom: loc(this.progPresent, "uBloom"),
+            uBloomAmount: loc(this.progPresent, "uBloomAmount"),
+            uResolution: loc(this.progPresent, "uResolution"),
+            uMaskDark: loc(this.progPresent, "uMaskDark"),
+            uMaskLight: loc(this.progPresent, "uMaskLight"),
+            uMaskScale: loc(this.progPresent, "uMaskScale"),
+            uMaskWidth: loc(this.progPresent, "uMaskWidth"),
+            uMaskHeight: loc(this.progPresent, "uMaskHeight"),
+            uGapWidth: loc(this.progPresent, "uGapWidth"),
+            uGapHeight: loc(this.progPresent, "uGapHeight"),
+            uMaskFade: loc(this.progPresent, "uMaskFade"),
+            uVignette: loc(this.progPresent, "uVignette"),
+            uWarpUnused: loc(this.progPresent, "uWarp"),
+         };
+         this.uAccum = {
+            uCur: loc(this.progAccum, "uCur"),
+            uPrev: loc(this.progAccum, "uPrev"),
+            uDecay: loc(this.progAccum, "uDecay"),
+         };
+         this.uBright = { uTex: loc(this.progBright, "uTex") };
+         this.uBlur = { uTex: loc(this.progBlur, "uTex"), uTexel: loc(this.progBlur, "uTexel") };
 
          // Setup vertices quad (two triangles covering the full viewport)
          // Each vertex has: X, Y (position), U, V (texture coordinate)
@@ -753,10 +1049,9 @@ export class CRTEmulator {
       if (!this.useWebGL || !this.gl || !this.glProgramCRT || !this.uniforms) return;
 
       const gl = this.gl;
-
-      gl.viewport(0, 0, this.canvas.width, this.canvas.height);
-      gl.clearColor(0, 0, 0, 1);
-      gl.clear(gl.COLOR_BUFFER_BIT);
+      const opt = customOptions ? { ...DEFAULT_OPTIONS, ...customOptions } : DEFAULT_OPTIONS;
+      const useMultipass = this.multipassAvailable &&
+         ((opt.persistence ?? 0) > 0 || (opt.bloom ?? 0) > 0);
 
       const texW = SCREEN_W;
       const texH = doubleScanlines ? SCREEN_H * 2 : SCREEN_H;
@@ -767,6 +1062,15 @@ export class CRTEmulator {
       gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, texW, texH, 0, gl.RGBA, gl.UNSIGNED_BYTE, imageData.data);
 
+      if (useMultipass) {
+         this.renderMultipass(SCREEN_W, SCREEN_H, doubleScanlines, imageData, opt);
+         return;
+      }
+
+      gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+      gl.clearColor(0, 0, 0, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+
       gl.useProgram(this.glProgramCRT);
 
       gl.uniform1i(this.uniforms.uSampler, 0);
@@ -774,7 +1078,6 @@ export class CRTEmulator {
       gl.uniform2f(this.uniforms.uTextureResolution, texW, texH);
 
       // Set CRT shader uniforms dynamically, merging with defaults
-      const opt = customOptions ? { ...DEFAULT_OPTIONS, ...customOptions } : DEFAULT_OPTIONS;
       gl.uniform1f(this.uniforms.uHardScan, opt.hardScan);
       gl.uniform1f(this.uniforms.uHardPix, opt.hardPix);
       gl.uniform2f(this.uniforms.uWarp, opt.warp, opt.warp);
@@ -809,6 +1112,219 @@ export class CRTEmulator {
       gl.vertexAttribPointer(aTexCoordLoc, 2, gl.FLOAT, false, 16, 8);
 
       gl.drawArrays(gl.TRIANGLES, 0, 6);
+   }
+
+   /**
+    * Multipass path: scene -> (persistence accumulate) -> bloom -> present.
+    * Used only when persistence or bloom are non-zero.
+    */
+   private renderMultipass(
+      SCREEN_W: number,
+      SCREEN_H: number,
+      doubleScanlines: boolean,
+      _imageData: ImageData,
+      opt: Required<CRTEmulatorOptions>
+   ): void {
+      const gl = this.gl!;
+      const now = performance.now() / 1000;
+      let dt = now - this.lastFrameTime;
+      this.lastFrameTime = now;
+      if (dt < 0 || dt > 0.25) dt = 1 / 60; // first frame or after a stall
+
+      const cw = this.canvas.width, chh = this.canvas.height;
+
+      // Recreate FBOs when the canvas is resized
+      if (this.multipassSize[0] !== cw || this.multipassSize[1] !== chh) {
+         this.ensureFBOs(cw, chh);
+      }
+      if (!this.fboScene || !this.fboAccum[0] || !this.fboAccum[1]) return;
+
+      const aPos = this.uniforms!.aPosition, aUv = this.uniforms!.aTexCoord;
+      const bindQuad = (prog: WebGLProgram) => {
+         gl.useProgram(prog);
+         gl.enableVertexAttribArray(aPos);
+         gl.enableVertexAttribArray(aUv);
+         gl.bindBuffer(gl.ARRAY_BUFFER, this.glVertexBuffer);
+         gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 16, 0);
+         gl.vertexAttribPointer(aUv, 2, gl.FLOAT, false, 16, 8);
+      };
+
+      // --- pass 1: scene -> FBO (linear light)
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.fboScene);
+      gl.viewport(0, 0, cw, chh);
+      bindQuad(this.progScene!);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, this.glTex);
+      gl.uniform1i(this.uScene.uSampler!, 0);
+      gl.uniform2f(this.uScene.uResolution!, cw, chh);
+      gl.uniform2f(this.uScene.uTextureResolution!, SCREEN_W, doubleScanlines ? SCREEN_H * 2 : SCREEN_H);
+      gl.uniform1f(this.uScene.uHardScan!, opt.hardScan);
+      gl.uniform1f(this.uScene.uHardPix!, opt.hardPix);
+      gl.uniform2f(this.uScene.uWarp!, opt.warp, opt.warp);
+      gl.uniform1f(this.uScene.uChromaBleed!, opt.chromaBleed);
+      gl.uniform1f(this.uScene.uChromaPhase!, opt.chromaPhase);
+      gl.uniform1f(this.uScene.uChromaCrosstalk!, opt.chromaCrosstalk);
+      gl.uniform1f(this.uScene.uConvergence!, opt.convergence);
+      gl.uniform1f(this.uScene.uJitter!, opt.jitter);
+      gl.uniform1f(this.uScene.uTime!, performance.now() / 1000);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+      // --- pass 2: persistence accumulation (ping-pong)
+      let sceneTex = this.texScene;
+      if ((opt.persistence ?? 0) > 0) {
+         const writeIdx = this.accumIndex;
+         const readIdx = 1 - writeIdx;
+         const decay = Math.pow(opt.persistence!, dt * 60);
+         gl.bindFramebuffer(gl.FRAMEBUFFER, this.fboAccum[writeIdx]);
+         gl.viewport(0, 0, cw, chh);
+         bindQuad(this.progAccum!);
+         gl.activeTexture(gl.TEXTURE0);
+         gl.bindTexture(gl.TEXTURE_2D, sceneTex);
+         gl.uniform1i(this.uAccum.uCur!, 0);
+         gl.activeTexture(gl.TEXTURE1);
+         gl.bindTexture(gl.TEXTURE_2D, this.texAccum[readIdx]);
+         gl.uniform1i(this.uAccum.uPrev!, 1);
+         gl.uniform1f(this.uAccum.uDecay!, decay);
+         gl.drawArrays(gl.TRIANGLES, 0, 6);
+         sceneTex = this.texAccum[writeIdx];
+         this.accumIndex = readIdx;
+      }
+
+      // --- bloom chain: bright-pass + blur H + blur V at 1/4 resolution
+      let bloomTex = this.texBloomA;
+      if ((opt.bloom ?? 0) > 0 && this.fboBloomA && this.fboBloomB) {
+         const [bw, bh] = this.bloomSize;
+
+         gl.bindFramebuffer(gl.FRAMEBUFFER, this.fboBloomA);
+         gl.viewport(0, 0, bw, bh);
+         bindQuad(this.progBright!);
+         gl.activeTexture(gl.TEXTURE0);
+         gl.bindTexture(gl.TEXTURE_2D, sceneTex);
+         gl.uniform1i(this.uBright.uTex!, 0);
+         gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+         // blur horizontal (into B)
+         gl.bindFramebuffer(gl.FRAMEBUFFER, this.fboBloomB);
+         gl.viewport(0, 0, bw, bh);
+         bindQuad(this.progBlur!);
+         gl.activeTexture(gl.TEXTURE0);
+         gl.bindTexture(gl.TEXTURE_2D, this.texBloomA);
+         gl.uniform1i(this.uBlur.uTex!, 0);
+         gl.uniform2f(this.uBlur.uTexel!, 1 / bw, 0);
+         gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+         // blur vertical (into A)
+         gl.bindFramebuffer(gl.FRAMEBUFFER, this.fboBloomA);
+         gl.viewport(0, 0, bw, bh);
+         bindQuad(this.progBlur!);
+         gl.activeTexture(gl.TEXTURE0);
+         gl.bindTexture(gl.TEXTURE_2D, this.texBloomB);
+         gl.uniform1i(this.uBlur.uTex!, 0);
+         gl.uniform2f(this.uBlur.uTexel!, 0, 1 / bh);
+         gl.drawArrays(gl.TRIANGLES, 0, 6);
+         bloomTex = this.texBloomA;
+      }
+
+      // --- final pass: present to the canvas
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.viewport(0, 0, cw, chh);
+      bindQuad(this.progPresent!);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, sceneTex);
+      gl.uniform1i(this.uPresent.uScene!, 0);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, bloomTex);
+      gl.uniform1i(this.uPresent.uBloom!, 1);
+      gl.uniform1f(this.uPresent.uBloomAmount!, opt.bloom ?? 0);
+      gl.uniform2f(this.uPresent.uResolution!, cw, chh);
+      gl.uniform1f(this.uPresent.uMaskDark!, opt.maskDark);
+      gl.uniform1f(this.uPresent.uMaskLight!, opt.maskLight);
+      gl.uniform1f(this.uPresent.uMaskScale!, opt.maskScale);
+      gl.uniform1f(this.uPresent.uMaskWidth!, opt.maskWidth);
+      gl.uniform1f(this.uPresent.uMaskHeight!, opt.maskHeight);
+      gl.uniform1f(this.uPresent.uGapWidth!, opt.gapWidth);
+      gl.uniform1f(this.uPresent.uGapHeight!, opt.gapHeight);
+      gl.uniform1f(this.uPresent.uMaskFade!, opt.maskFade);
+      gl.uniform1f(this.uPresent.uVignette!, opt.vignette);
+      const maskTypeIndex2 = opt.maskType === "grille" ? 1 : (opt.maskType === "delta" ? 2 : 0);
+      gl.uniform1i(this.uPresent.uMaskType!, maskTypeIndex2);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+   }
+
+   /**
+    * (Re)creates the offscreen framebuffers used by the multipass path.
+    */
+   private ensureFBOs(w: number, h: number): void {
+      const gl = this.gl!;
+      this.destroyFBOs();
+
+      // Linear filtering + clamp for all intermediate textures
+      const setupTex = (tex: WebGLTexture, tw: number, th: number) => {
+         gl.bindTexture(gl.TEXTURE_2D, tex);
+         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, tw, th, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+      };
+
+      this.texScene = gl.createTexture();
+      setupTex(this.texScene, w, h);
+      this.fboScene = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.fboScene);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.texScene, 0);
+
+      for (let i = 0; i < 2; i++) {
+         this.texAccum[i] = gl.createTexture();
+         setupTex(this.texAccum[i]!, w, h);
+         this.fboAccum[i] = gl.createFramebuffer();
+         gl.bindFramebuffer(gl.FRAMEBUFFER, this.fboAccum[i]);
+         gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.texAccum[i], 0);
+      }
+
+      const bw = Math.max(1, w >> 2), bh = Math.max(1, h >> 2);
+      this.bloomSize = [bw, bh];
+      this.texBloomA = gl.createTexture();
+      setupTex(this.texBloomA, bw, bh);
+      this.fboBloomA = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.fboBloomA);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.texBloomA, 0);
+
+      this.texBloomB = gl.createTexture();
+      setupTex(this.texBloomB, bw, bh);
+      this.fboBloomB = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.fboBloomB);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.texBloomB, 0);
+
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      this.multipassSize = [w, h];
+   }
+
+   /**
+    * Deletes all multipass framebuffer resources.
+    */
+   private destroyFBOs(): void {
+      const gl = this.gl;
+      if (!gl) return;
+      if (this.texScene) gl.deleteTexture(this.texScene);
+      if (this.fboScene) gl.deleteFramebuffer(this.fboScene);
+      for (let i = 0; i < 2; i++) {
+         if (this.texAccum[i]) gl.deleteTexture(this.texAccum[i]);
+         if (this.fboAccum[i]) gl.deleteFramebuffer(this.fboAccum[i]);
+      }
+      if (this.texBloomA) gl.deleteTexture(this.texBloomA);
+      if (this.fboBloomA) gl.deleteFramebuffer(this.fboBloomA);
+      if (this.texBloomB) gl.deleteTexture(this.texBloomB);
+      if (this.fboBloomB) gl.deleteFramebuffer(this.fboBloomB);
+      this.texScene = null;
+      this.fboScene = null;
+      this.texAccum = [null, null];
+      this.fboAccum = [null, null];
+      this.texBloomA = null;
+      this.fboBloomA = null;
+      this.texBloomB = null;
+      this.fboBloomB = null;
+      this.multipassSize = [0, 0];
    }
 
    /**
@@ -874,9 +1390,18 @@ export class CRTEmulator {
 
       const gl = this.gl;
       if (gl && this.useWebGL) {
+         this.destroyFBOs();
          if (this.glTex) gl.deleteTexture(this.glTex);
          if (this.glVertexBuffer) gl.deleteBuffer(this.glVertexBuffer);
          if (this.glProgramCRT) gl.deleteProgram(this.glProgramCRT);
+         for (const p of [this.progScene, this.progPresent, this.progAccum, this.progBright, this.progBlur]) {
+            if (p) gl.deleteProgram(p);
+         }
+         this.progScene = null;
+         this.progPresent = null;
+         this.progAccum = null;
+         this.progBright = null;
+         this.progBlur = null;
          this.glTex = null;
          this.glVertexBuffer = null;
          this.glProgramCRT = null;

@@ -52,6 +52,42 @@ The chroma low-pass kernel grows continuously from zero effect at `chromaBleed =
 so small values produce proportionally subtle bleeding instead of jumping straight to
 a full smear.
 
+## Additional effects
+
+All optional, default off. When any of them is non-zero the emulator switches to a
+multipass render path (offscreen framebuffers); at defaults it stays on the fast
+single-pass path.
+
+- **`convergence`** (default `0`) — beam convergence error in output pixels: red is
+  sampled slightly left and blue slightly right of green, producing colour fringes on
+  sharp edges like a misconverged colour TV. Typical values 0.3–1.
+- **`vignette`** (default `0`) — corner darkening (0..1), approximating tube edge
+  falloff. Try `0.2–0.4`.
+- **`jitter`** (default `0`) — horizontal sync jitter amplitude in output pixels.
+  Each scanline is displaced by a pseudo-random amount that changes over time,
+  mimicking imperfect sync on marginal signals. Keep sub-pixel (`< 1`).
+- **`persistence`** (default `0`, up to `0.95`) — phosphor afterglow. Bright areas
+  fade out over several frames instead of vanishing instantly; decay is frame-rate
+  independent. Values around `0.8–0.9` give a subtle ghosting trail.
+- **`bloom`** (default `0`, up to `1`) — soft glow around bright areas (beam spread +
+  glass reflections), computed with a bright-pass + separable blur at quarter
+  resolution. Start around `0.3`.
+- **`maskType`** (default `"slot"`) — phosphor mask geometry: `"slot"` (staggered RGB
+  slots, as in late colour TVs/monitors), `"grille"` (continuous vertical stripes,
+  aperture grille) or `"delta"` (per-row rotating RGB order, delta-gun shadow mask of
+  early colour TV sets).
+
+```ts
+crt.render(320, 200, false, imageData, {
+  convergence: 0.6,
+  vignette: 0.25,
+  jitter: 0.3,
+  persistence: 0.85,
+  bloom: 0.3,
+  maskType: "delta",
+});
+```
+
 ## Interactive Control Panel
 
 You can open a floating, draggable parameters window at any time by calling `window.crt_emulator()` in the console or from code:

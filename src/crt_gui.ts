@@ -177,6 +177,24 @@ const PARAM_CONFIGS: ParamConfig[] = [
       defaultValue: DEFAULT_OPTIONS.jitter,
       description: "Horizontal sync jitter amplitude in pixels (animated)",
    },
+   {
+      key: "persistence",
+      label: "persistence",
+      min: 0.0,
+      max: 0.95,
+      step: 0.01,
+      defaultValue: DEFAULT_OPTIONS.persistence,
+      description: "Phosphor afterglow (ghosting/fade-out of bright areas)",
+   },
+   {
+      key: "bloom",
+      label: "bloom",
+      min: 0.0,
+      max: 1.0,
+      step: 0.01,
+      defaultValue: DEFAULT_OPTIONS.bloom,
+      description: "Glow around bright areas",
+   },
 ];
 
 const SELECT_PARAM_CONFIGS: SelectParamConfig[] = [
