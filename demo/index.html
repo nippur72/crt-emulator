@@ -33,6 +33,16 @@
   <div><label>chromaCrosstalk</label><input id="xtalk" type="range" min="0" max="1" step="0.05" value="0.5"><span id="xtalkv"></span></div>
   <div><label>maskScale</label><input id="mask" type="range" min="0.5" max="3" step="0.05" value="1.25"><span id="maskv"></span></div>
   <div><label>warp</label><input id="warp" type="range" min="0" max="0.12" step="0.005" value="0.04"><span id="warpv"></span></div>
+  <div><label>convergence</label><input id="conv" type="range" min="0" max="3" step="0.05" value="0"><span id="convv"></span></div>
+  <div><label>vignette</label><input id="vig" type="range" min="0" max="1" step="0.01" value="0"><span id="vigv"></span></div>
+  <div><label>jitter</label><input id="jit" type="range" min="0" max="3" step="0.05" value="0"><span id="jitv"></span></div>
+  <div><label>maskType</label>
+    <select id="mtype">
+      <option value="slot">slot</option>
+      <option value="grille">grille</option>
+      <option value="delta">delta</option>
+    </select>
+  </div>
   <div><label><input id="double" type="checkbox"> double scanlines</label></div>
   <div style="margin-top:8px;">
     <button id="open-window-btn" type="button" style="background:#3a3a4c; color:#eee; border:1px solid #666; padding:5px 12px; border-radius:4px; cursor:pointer; font-family:inherit;">Open CRT Parameters Window (window.crt_emulator())</button>
@@ -159,7 +169,7 @@ const crt = new CRTEmulator(canvas);
 crt.init();
 
 const el = (id) => document.getElementById(id);
-const labels = { bleed: "bleedv", phase: "phasev", xtalk: "xtalkv", mask: "maskv", warp: "warpv" };
+const labels = { bleed: "bleedv", phase: "phasev", xtalk: "xtalkv", mask: "maskv", warp: "warpv", conv: "convv", vig: "vigv", jit: "jitv" };
 for (const [id, span] of Object.entries(labels)) {
   el(span).textContent = el(id).value;
   el(id).addEventListener("input", () => {
@@ -177,6 +187,10 @@ function getCurrentPageOpts() {
     chromaCrosstalk: parseFloat(el("xtalk").value),
     maskScale: parseFloat(el("mask").value),
     warp: parseFloat(el("warp").value),
+    convergence: parseFloat(el("conv").value),
+    vignette: parseFloat(el("vig").value),
+    jitter: parseFloat(el("jit").value),
+    maskType: el("mtype").value,
   };
 }
 
@@ -186,25 +200,22 @@ let currentCustomOptions = getCurrentPageOpts();
 window.addEventListener("crt-emulator:change", (e) => {
   currentCustomOptions = e.detail;
   // Update on-page sliders if they exist
-  if (e.detail.chromaBleed !== undefined && el("bleed")) {
-    el("bleed").value = e.detail.chromaBleed;
-    el("bleedv").textContent = e.detail.chromaBleed;
-  }
-  if (e.detail.chromaPhase !== undefined && el("phase")) {
-    el("phase").value = e.detail.chromaPhase;
-    el("phasev").textContent = e.detail.chromaPhase;
-  }
-  if (e.detail.chromaCrosstalk !== undefined && el("xtalk")) {
-    el("xtalk").value = e.detail.chromaCrosstalk;
-    el("xtalkv").textContent = e.detail.chromaCrosstalk;
-  }
-  if (e.detail.maskScale !== undefined && el("mask")) {
-    el("mask").value = e.detail.maskScale;
-    el("maskv").textContent = e.detail.maskScale;
-  }
-  if (e.detail.warp !== undefined && el("warp")) {
-    el("warp").value = e.detail.warp;
-    el("warpv").textContent = e.detail.warp;
+  const syncNum = (key, id, spanId) => {
+    if (e.detail[key] !== undefined && el(id)) {
+      el(id).value = e.detail[key];
+      el(spanId).textContent = e.detail[key];
+    }
+  };
+  syncNum("chromaBleed", "bleed", "bleedv");
+  syncNum("chromaPhase", "phase", "phasev");
+  syncNum("chromaCrosstalk", "xtalk", "xtalkv");
+  syncNum("maskScale", "mask", "maskv");
+  syncNum("warp", "warp", "warpv");
+  syncNum("convergence", "conv", "convv");
+  syncNum("vignette", "vig", "vigv");
+  syncNum("jitter", "jit", "jitv");
+  if (e.detail.maskType !== undefined && el("mtype")) {
+    el("mtype").value = e.detail.maskType;
   }
 });
 

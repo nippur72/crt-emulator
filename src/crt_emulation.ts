@@ -123,6 +123,41 @@ export interface CRTEmulatorOptions {
     * @default 0.9
     */
    maskFade?: number;
+
+   /**
+    * Beam convergence error in output pixels.
+    * Simulates misconverged RGB guns: red is displaced left, blue right of
+    * green, producing colour fringes on sharp edges (classic un-calibrated
+    * colour TV look).
+    * @default 0.0
+    */
+   convergence?: number;
+
+   /**
+    * Vignette strength (0.0 - 1.0).
+    * Darkens the screen corners like a real tube's edge falloff.
+    * @default 0.0
+    */
+   vignette?: number;
+
+   /**
+    * Horizontal sync jitter amplitude, in output pixels.
+    * Displaces each scanline by a small random amount that varies over time,
+    * mimicking imperfect horizontal synchronisation on marginal signals.
+    * @default 0.0
+    */
+   jitter?: number;
+
+   /**
+    * Phosphor mask geometry.
+    * - "slot": staggered RGB slots with dark gaps between rows and columns
+    *   (typical of late-model colour TVs and CRT monitors).
+    * - "grille": continuous vertical RGB stripes (aperture grille).
+    * - "delta": staggered triads whose RGB order rotates every phosphor row
+    *   (delta-gun shadow mask, typical of early colour TV sets).
+    * @default "slot"
+    */
+   maskType?: "slot" | "grille" | "delta";
 }
 
 /**
@@ -144,6 +179,10 @@ export const DEFAULT_OPTIONS: Required<CRTEmulatorOptions> = {
    gapWidth: 0.25,
    gapHeight: 0.5,
    maskFade: 0.9,
+   convergence: 0.0,
+   vignette: 0.0,
+   jitter: 0.0,
+   maskType: "slot",
 };
 
 /**
@@ -168,6 +207,11 @@ interface CRTEmulatorUniforms {
    uGapWidth: WebGLUniformLocation | null;
    uGapHeight: WebGLUniformLocation | null;
    uMaskFade: WebGLUniformLocation | null;
+   uConvergence: WebGLUniformLocation | null;
+   uVignette: WebGLUniformLocation | null;
+   uJitter: WebGLUniformLocation | null;
+   uTime: WebGLUniformLocation | null;
+   uMaskType: WebGLUniformLocation | null;
    aPosition: number;
    aTexCoord: number;
 }
@@ -198,6 +242,11 @@ const fsCRTSource = `
       uniform float uGapWidth;
       uniform float uGapHeight;
       uniform float uMaskFade;
+      uniform float uConvergence;
+      uniform float uVignette;
+      uniform float uJitter;
+      uniform float uTime;
+      uniform int uMaskType;
 
       // sRGB to Linear.
       // Assuming using sRGB typed textures this should not be needed.
@@ -387,15 +436,25 @@ const fsCRTSource = `
 
       // Distortion of scanlines, and end of screen alpha.
       vec2 Warp(vec2 pos) {
-         pos = pos * 2.0 - 1.0;    
+         pos = pos * 2.0 - 1.0;
          pos *= vec2(1.0 + (pos.y * pos.y) * uWarp.x, 1.0 + (pos.x * pos.x) * uWarp.y);
          return pos * 0.5 + 0.5;
       }
 
+      // 1D hash for per-scanline jitter (sin-free, stable across GPUs).
+      float hash11(float p) {
+         p = fract(p * 0.1031);
+         p *= p + 33.33;
+         p *= p + p;
+         return fract(p);
+      }
+
       // Shadow mask.
+      // uMaskType: 0 = slot (staggered slots), 1 = grille (vertical stripes),
+      // 2 = delta (triads with per-row rotating RGB order).
       vec3 Mask(vec2 pos) {
          pos = pos / uMaskScale;
-         
+
          // Derivative-based moire detection (requires OES_standard_derivatives;
          // without it the mask is rendered constant instead of failing to compile)
 #ifdef HAS_DERIVATIVES
@@ -405,44 +464,93 @@ const fsCRTSource = `
 #else
          float blend = 0.0;
 #endif
-         
+
          // Calculate average mask color
          float activeArea = (uMaskWidth - uGapWidth) * (uMaskHeight - uGapHeight) / (uMaskWidth * uMaskHeight);
          vec3 maskAvg = activeArea * vec3((uMaskLight + 2.0 * uMaskDark) / 3.0) + (1.0 - activeArea) * vec3(uMaskDark);
-         
+
+         // Aperture grille: vertical stripes only, no row gaps, no stagger.
+         if (uMaskType == 1) {
+            float xModG = mod(pos.x, uMaskWidth);
+            float subW = (uMaskWidth - uGapWidth) / 3.0;
+            vec3 m = vec3(uMaskDark);
+            if (xModG < subW) {
+               m.r = uMaskLight;
+            } else if (xModG < 2.0 * subW) {
+               m.g = uMaskLight;
+            } else {
+               m.b = uMaskLight;
+            }
+            return mix(m, maskAvg, blend);
+         }
+
+         // Stagger every other column of the mask grid.
          float col = floor(pos.x / uMaskWidth);
          float y = pos.y + mod(col, 2.0) * (uMaskHeight / 2.0);
-         
+
+         // Delta-gun: no full-width horizontal gap rows; the RGB order rotates
+         // every triad row so neighbouring rows are offset by one phosphor.
+         float rowIdx = floor(y / uMaskHeight);
+         float channelShift = (uMaskType == 2) ? mod(rowIdx, 3.0) : 0.0;
+
          // Horizontal dark row gap (modulus check)
          float yMod = mod(y, uMaskHeight);
-         if (yMod >= (uMaskHeight - uGapHeight)) {
-            return mix(vec3(uMaskDark, uMaskDark, uMaskDark), maskAvg, blend);
+         if (uMaskType != 2 && yMod >= (uMaskHeight - uGapHeight)) {
+            return mix(vec3(uMaskDark), maskAvg, blend);
          }
-         
+
          // Vertical dark column gap (modulus check)
          float xMod = mod(pos.x, uMaskWidth);
          if (xMod >= (uMaskWidth - uGapWidth)) {
-            return mix(vec3(uMaskDark, uMaskDark, uMaskDark), maskAvg, blend);
+            return mix(vec3(uMaskDark), maskAvg, blend);
          }
-         
+
          // Active triad subpixel calculation
          float activeWidth = uMaskWidth - uGapWidth;
          float subpixelWidth = activeWidth / 3.0;
-         
-         vec3 mask = vec3(uMaskDark, uMaskDark, uMaskDark);
+
+         vec3 mask = vec3(uMaskDark);
+         int slot;
          if (xMod < subpixelWidth) {
-            mask.r = uMaskLight;
+            slot = 0;
          } else if (xMod < 2.0 * subpixelWidth) {
+            slot = 1;
+         } else {
+            slot = 2;
+         }
+         slot = int(mod(float(slot + int(channelShift)), 3.0));
+         if (slot == 0) {
+            mask.r = uMaskLight;
+         } else if (slot == 1) {
             mask.g = uMaskLight;
          } else {
             mask.b = uMaskLight;
          }
          return mix(mask, maskAvg, blend);
-      }    
+      }
 
       void main(void) {
          vec2 pos = Warp(vTexCoord);
-         vec3 rawColor = Tri(pos);
+
+         // Horizontal sync jitter: displace each scanline by a pseudo-random
+         // amount, changing over time.
+         if (uJitter > 0.0) {
+            float lineIdx = floor(pos.y * uTextureResolution.y);
+            pos.x += (hash11(lineIdx + floor(uTime * 13.0)) - 0.5) * uJitter / uResolution.x;
+         }
+
+         vec3 rawColor;
+         if (uConvergence > 0.0) {
+            // Beam convergence error: red sampled left of green, blue right,
+            // producing colour fringes on sharp vertical edges.
+            float conv = uConvergence / uResolution.x;
+            float r = Tri(vec2(pos.x - conv, pos.y)).r;
+            float g = Tri(pos).g;
+            float b = Tri(vec2(pos.x + conv, pos.y)).b;
+            rawColor = vec3(r, g, b);
+         } else {
+            rawColor = Tri(pos);
+         }
 
          // Composite chroma processing (bleed + fringing), one pass per pixel.
          if (uChromaBleed > 0.0 || uChromaCrosstalk > 0.0) {
@@ -450,14 +558,21 @@ const fsCRTSource = `
          }
 
          vec3 maskVal = Mask(pos * uResolution);
-         
+
          // Calculate luminance using standard weights
          float luma = dot(rawColor, vec3(0.299, 0.587, 0.114));
-         
+
          // Fade the mask towards 1.0 (white/no mask) on bright areas
          vec3 dynamicMask = mix(maskVal, vec3(1.0), luma * uMaskFade);
-         
+
          vec3 color = rawColor * dynamicMask;
+
+         // Corner falloff (vignette)
+         if (uVignette > 0.0) {
+            float r2 = length((pos - 0.5) * vec2(1.25, 1.0)) * 1.4;
+            color *= 1.0 - uVignette * pow(clamp(r2, 0.0, 1.0), 2.5);
+         }
+
          gl_FragColor = vec4(ToSrgb(color), 1.0);
       }
    `;
@@ -576,6 +691,11 @@ export class CRTEmulator {
             uGapWidth: gl.getUniformLocation(this.glProgramCRT, "uGapWidth"),
             uGapHeight: gl.getUniformLocation(this.glProgramCRT, "uGapHeight"),
             uMaskFade: gl.getUniformLocation(this.glProgramCRT, "uMaskFade"),
+            uConvergence: gl.getUniformLocation(this.glProgramCRT, "uConvergence"),
+            uVignette: gl.getUniformLocation(this.glProgramCRT, "uVignette"),
+            uJitter: gl.getUniformLocation(this.glProgramCRT, "uJitter"),
+            uTime: gl.getUniformLocation(this.glProgramCRT, "uTime"),
+            uMaskType: gl.getUniformLocation(this.glProgramCRT, "uMaskType"),
             aPosition: gl.getAttribLocation(this.glProgramCRT, "aPosition"),
             aTexCoord: gl.getAttribLocation(this.glProgramCRT, "aTexCoord"),
          };
@@ -669,6 +789,12 @@ export class CRTEmulator {
       gl.uniform1f(this.uniforms.uGapWidth, opt.gapWidth);
       gl.uniform1f(this.uniforms.uGapHeight, opt.gapHeight);
       gl.uniform1f(this.uniforms.uMaskFade, opt.maskFade);
+      gl.uniform1f(this.uniforms.uConvergence, opt.convergence);
+      gl.uniform1f(this.uniforms.uVignette, opt.vignette);
+      gl.uniform1f(this.uniforms.uJitter, opt.jitter);
+      gl.uniform1f(this.uniforms.uTime, performance.now() / 1000);
+      const maskTypeIndex = opt.maskType === "grille" ? 1 : (opt.maskType === "delta" ? 2 : 0);
+      gl.uniform1i(this.uniforms.uMaskType, maskTypeIndex);
 
       const aPositionLoc = this.uniforms.aPosition;
       const aTexCoordLoc = this.uniforms.aTexCoord;

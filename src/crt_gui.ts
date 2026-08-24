@@ -13,6 +13,16 @@ interface ParamConfig {
    description: string;
 }
 
+/**
+ * Metadata for enum-valued parameters rendered as a dropdown select.
+ */
+interface SelectParamConfig {
+   key: keyof CRTEmulatorOptions;
+   label: string;
+   options: { label: string; value: string }[];
+   description: string;
+}
+
 const PARAM_CONFIGS: ParamConfig[] = [
    {
       key: "hardScan",
@@ -139,6 +149,46 @@ const PARAM_CONFIGS: ParamConfig[] = [
       step: 0.01,
       defaultValue: DEFAULT_OPTIONS.maskFade,
       description: "Dynamic mask fading factor on bright pixels",
+   },
+   {
+      key: "convergence",
+      label: "convergence",
+      min: 0.0,
+      max: 3.0,
+      step: 0.05,
+      defaultValue: DEFAULT_OPTIONS.convergence,
+      description: "Beam convergence error in pixels (R left, B right)",
+   },
+   {
+      key: "vignette",
+      label: "vignette",
+      min: 0.0,
+      max: 1.0,
+      step: 0.01,
+      defaultValue: DEFAULT_OPTIONS.vignette,
+      description: "Corner darkening strength (tube edge falloff)",
+   },
+   {
+      key: "jitter",
+      label: "jitter",
+      min: 0.0,
+      max: 3.0,
+      step: 0.05,
+      defaultValue: DEFAULT_OPTIONS.jitter,
+      description: "Horizontal sync jitter amplitude in pixels (animated)",
+   },
+];
+
+const SELECT_PARAM_CONFIGS: SelectParamConfig[] = [
+   {
+      key: "maskType",
+      label: "maskType",
+      options: [
+         { label: "slot", value: "slot" },
+         { label: "grille", value: "grille" },
+         { label: "delta", value: "delta" },
+      ],
+      description: "Phosphor mask geometry (slot / aperture grille / delta-gun)",
    },
 ];
 
@@ -302,6 +352,18 @@ function injectStyles(): void {
          border: 1px solid #ffffff;
          cursor: pointer;
       }
+      .crt-gui-select {
+         width: 100%;
+         background: #323242;
+         color: #e0e0e8;
+         border: 1px solid #4a4a60;
+         border-radius: 4px;
+         padding: 3px 6px;
+         font-family: inherit;
+         font-size: 11px;
+         outline: none;
+         cursor: pointer;
+      }
       .crt-gui-footer {
          display: flex;
          gap: 8px;
@@ -410,6 +472,7 @@ export function crt_emulator(
    content.className = "crt-gui-content";
 
    const sliderElements = new Map<keyof CRTEmulatorOptions, { input: HTMLInputElement; valSpan: HTMLElement }>();
+   const selectElements = new Map<keyof CRTEmulatorOptions, HTMLSelectElement>();
 
    const notifyChange = () => {
       const optsCopy = { ...currentOptions };
@@ -435,7 +498,7 @@ export function crt_emulator(
 
       const valSpan = document.createElement("span");
       valSpan.className = "crt-gui-value";
-      const initialVal = currentOptions[param.key] ?? param.defaultValue;
+      const initialVal = (currentOptions[param.key] as number | undefined) ?? param.defaultValue;
       valSpan.textContent = formatValue(initialVal, param.step);
 
       header.appendChild(label);
@@ -451,7 +514,7 @@ export function crt_emulator(
 
       input.addEventListener("input", () => {
          const val = parseFloat(input.value);
-         currentOptions[param.key] = val;
+         (currentOptions as Record<string, unknown>)[param.key as string] = val;
          valSpan.textContent = formatValue(val, param.step);
          notifyChange();
       });
@@ -461,6 +524,45 @@ export function crt_emulator(
       content.appendChild(row);
 
       sliderElements.set(param.key, { input, valSpan });
+   }
+
+   for (const param of SELECT_PARAM_CONFIGS) {
+      const row = document.createElement("div");
+      row.className = "crt-gui-row";
+      row.title = param.description;
+
+      const header = document.createElement("div");
+      header.className = "crt-gui-row-header";
+
+      const label = document.createElement("span");
+      label.className = "crt-gui-label";
+      label.textContent = param.label;
+
+      header.appendChild(label);
+
+      const input = document.createElement("select");
+      input.className = "crt-gui-select";
+      for (const opt of param.options) {
+         const option = document.createElement("option");
+         option.value = opt.value;
+         option.textContent = opt.label;
+         input.appendChild(option);
+      }
+      const current = currentOptions[param.key];
+      if (typeof current === "string") {
+         input.value = current;
+      }
+
+      input.addEventListener("change", () => {
+         (currentOptions as Record<string, unknown>)[param.key as string] = input.value;
+         notifyChange();
+      });
+
+      row.appendChild(header);
+      row.appendChild(input);
+      content.appendChild(row);
+
+      selectElements.set(param.key, input);
    }
 
    win.appendChild(content);
@@ -478,11 +580,19 @@ export function crt_emulator(
    resetBtn.textContent = "Reset Defaults";
    resetBtn.addEventListener("click", () => {
       for (const param of PARAM_CONFIGS) {
-         currentOptions[param.key] = param.defaultValue;
+         (currentOptions as Record<string, unknown>)[param.key as string] = param.defaultValue;
          const entry = sliderElements.get(param.key);
          if (entry) {
             entry.input.value = param.defaultValue.toString();
             entry.valSpan.textContent = formatValue(param.defaultValue, param.step);
+         }
+      }
+      for (const param of SELECT_PARAM_CONFIGS) {
+         const defVal = DEFAULT_OPTIONS[param.key];
+         (currentOptions as Record<string, unknown>)[param.key as string] = defVal;
+         const sel = selectElements.get(param.key);
+         if (sel && typeof defVal === "string") {
+            sel.value = defVal;
          }
       }
       notifyChange();
@@ -586,12 +696,16 @@ export function crt_emulator(
       getOptions: () => ({ ...currentOptions }),
       setOptions: (newOptions: Partial<CRTEmulatorOptions>) => {
          Object.assign(currentOptions, newOptions);
-         for (const [key, val] of Object.entries(newOptions) as [keyof CRTEmulatorOptions, number][]) {
+         for (const [key, val] of Object.entries(newOptions) as [keyof CRTEmulatorOptions, number | string][]) {
             const entry = sliderElements.get(key);
             const param = PARAM_CONFIGS.find((p) => p.key === key);
-            if (entry && param && val !== undefined) {
+            if (entry && param && val !== undefined && typeof val === "number") {
                entry.input.value = val.toString();
                entry.valSpan.textContent = formatValue(val, param.step);
+            }
+            const sel = selectElements.get(key);
+            if (sel && typeof val === "string") {
+               sel.value = val;
             }
          }
          notifyChange();
