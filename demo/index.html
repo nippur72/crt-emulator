@@ -146,9 +146,10 @@ document.getElementById("reset").addEventListener("click", resetFrame);
 
 // --- optionally double rows (matching the emulator's doubleScanlines) -------
 function doubled(img) {
-  const d = new ImageData(W, H * 2);
-  for (let y = 0; y < H * 2; y++) {
-    d.data.set(img.data.subarray((y >> 1) * W * 4, ((y >> 1) + 1) * W * 4), y * W * 4);
+  const w = img.width, h = img.height;
+  const d = new ImageData(w, h * 2);
+  for (let y = 0; y < h * 2; y++) {
+    d.data.set(img.data.subarray((y >> 1) * w * 4, ((y >> 1) + 1) * w * 4), y * w * 4);
   }
   return d;
 }

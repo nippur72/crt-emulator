@@ -35,10 +35,22 @@ in `src/crt_emulation.ts`.
 - **`chromaPhase`** (default `0.5`) — colour-subcarrier phase advance in cycles per source
   pixel. This is the ratio of subcarrier to pixel clock and controls the hue of the
   crosstalk fringes: `0.5` for NTSC (C64 US: 3.58 MHz / 7.16 MHz), `0.625` for PAL
-  (C64 EU: 4.43 MHz / 7.09 MHz), `0` for a plain symmetric smear.
+  (C64 EU: 4.43 MHz / 7.09 MHz), `0` for a plain symmetric smear with no directional
+  fringing.
 - **`chromaCrosstalk`** (default `0.5`) — luma-to-chroma leakage (0..1). Sharp luminance
   edges contain energy at the subcarrier frequency; a real TV decodes this as spurious
   colour, producing the alternating rainbow fringes on text and high-contrast edges.
+
+### Notes on accuracy
+
+The composite chroma path is processed in **linear light** (the shader's working
+space), while hardware composite decoders operate on the gamma-encoded signal. This
+makes the bleed/fringe tint and spread subtly differ from real hardware; the overall
+character is preserved.
+
+The chroma low-pass kernel grows continuously from zero effect at `chromaBleed = 0`,
+so small values produce proportionally subtle bleeding instead of jumping straight to
+a full smear.
 
 ## Interactive Control Panel
 

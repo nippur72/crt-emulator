@@ -120,7 +120,7 @@ export interface CRTEmulatorOptions {
     * Dynamic mask fading factor on bright pixels.
     * - 0.0 = No fading (constant mask strength)
     * - 1.0 = Max fading (mask disappears entirely on white pixels)
-    * @default 0.3
+    * @default 0.9
     */
    maskFade?: number;
 }
@@ -147,7 +147,8 @@ export const DEFAULT_OPTIONS: Required<CRTEmulatorOptions> = {
 };
 
 /**
- * Internal interface to store compiled WebGL uniform locations.
+ * Internal interface to store compiled WebGL uniform locations and
+ * cached vertex attribute locations.
  */
 interface CRTEmulatorUniforms {
    uSampler: WebGLUniformLocation | null;
@@ -167,6 +168,8 @@ interface CRTEmulatorUniforms {
    uGapWidth: WebGLUniformLocation | null;
    uGapHeight: WebGLUniformLocation | null;
    uMaskFade: WebGLUniformLocation | null;
+   aPosition: number;
+   aTexCoord: number;
 }
 
 /**
@@ -175,7 +178,6 @@ interface CRTEmulatorUniforms {
  * and PAL composite signal chroma bleed emulation.
  */
 const fsCRTSource = `
-      #extension GL_OES_standard_derivatives : enable
       precision highp float;
       varying vec2 vTexCoord;
       uniform sampler2D uSampler;
@@ -253,13 +255,15 @@ const fsCRTSource = `
          float cy = floor(center.y) + 0.5;
 
          // Window radius and Gaussian sigma, in source texels.
-         // A minimum 1.5-texel window is kept so the crosstalk can see edges
-         // even when uChromaBleed is 0.
-         float radius = max(uChromaBleed, 1.5);
-         float sigma = max(uChromaBleed, 0.001) * 0.55;
+         // The kernel grows continuously from zero effect at uChromaBleed = 0.
+         float radius = max(uChromaBleed, 0.05);
+         float sigma = max(uChromaBleed, 0.05) * 0.55;
 
          // Subcarrier phase advance per source texel, in radians.
          float phaseStep = 6.28318530718 * uChromaPhase;
+         // Without a subcarrier there is no hue to demodulate against:
+         // disable the directional fringing (a plain symmetric smear remains).
+         float fringeAmt = (abs(uChromaPhase) < 1e-4) ? 0.0 : uChromaCrosstalk;
          // Reference phase: continuous across the scanline plus the ~180 deg
          // line-to-line alternation common to NTSC and PAL colour frames.
          float refPhase = phaseStep * cx + 3.14159265358979 * mod(floor(center.y), 2.0);
@@ -309,13 +313,13 @@ const fsCRTSource = `
          // The sharp luminance already carries the scanline/resampling
          // modulation from Tri(); apply the same factor to the window chroma
          // so flat areas keep a consistent brightness.
-         float mod = yuvSharp.x / max(lumaAvg, 1e-4);
-         mod = clamp(mod, 0.0, 4.0);
+         float modGain = yuvSharp.x / max(lumaAvg, 1e-4);
+         modGain = clamp(modGain, 0.0, 4.0);
 
-         vec2 composite = (chroma + uChromaCrosstalk * fringe) * mod;
+         vec2 composite = (chroma + fringeAmt * fringe) * modGain;
          vec2 finalChroma = (uChromaBleed > 0.0)
             ? composite
-            : yuvSharp.yz + uChromaCrosstalk * fringe * mod;
+            : yuvSharp.yz + fringeAmt * fringe * modGain;
          return YUVtoRGB(vec3(yuvSharp.x, finalChroma));
       }
 
@@ -392,10 +396,15 @@ const fsCRTSource = `
       vec3 Mask(vec2 pos) {
          pos = pos / uMaskScale;
          
-         // Derivative-based moire detection
+         // Derivative-based moire detection (requires OES_standard_derivatives;
+         // without it the mask is rendered constant instead of failing to compile)
+#ifdef HAS_DERIVATIVES
          vec2 d = fwidth(pos);
          float maxD = max(d.x / uMaskWidth, d.y / uMaskHeight);
          float blend = smoothstep(0.3, 0.8, maxD);
+#else
+         float blend = 0.0;
+#endif
          
          // Calculate average mask color
          float activeArea = (uMaskWidth - uGapWidth) * (uMaskHeight - uGapHeight) / (uMaskWidth * uMaskHeight);
@@ -496,8 +505,9 @@ export class CRTEmulator {
          }
          this.gl = gl;
 
-         // Enable standard derivatives extension for fwidth in WebGL 1.0 fragment shaders
-         gl.getExtension('OES_standard_derivatives');
+         // Enable standard derivatives extension for fwidth in WebGL 1.0 fragment shaders.
+         // Without it the shader falls back to a constant mask (no moire suppression).
+         const hasDerivatives = !!gl.getExtension('OES_standard_derivatives');
 
          // Compile Vertex Shader (Maps quad coordinates and texture coordinates)
          const vsSource = `
@@ -524,7 +534,8 @@ export class CRTEmulator {
          };
 
          const vs = loadShader(gl.VERTEX_SHADER, vsSource);
-         const fsCRT = loadShader(gl.FRAGMENT_SHADER, fsCRTSource);
+         const fragmentPrefix = hasDerivatives ? "#define HAS_DERIVATIVES 1\n" : "";
+         const fsCRT = loadShader(gl.FRAGMENT_SHADER, fragmentPrefix + fsCRTSource);
 
          if (!vs || !fsCRT) return false;
 
@@ -565,6 +576,8 @@ export class CRTEmulator {
             uGapWidth: gl.getUniformLocation(this.glProgramCRT, "uGapWidth"),
             uGapHeight: gl.getUniformLocation(this.glProgramCRT, "uGapHeight"),
             uMaskFade: gl.getUniformLocation(this.glProgramCRT, "uMaskFade"),
+            aPosition: gl.getAttribLocation(this.glProgramCRT, "aPosition"),
+            aTexCoord: gl.getAttribLocation(this.glProgramCRT, "aTexCoord"),
          };
 
          // Setup vertices quad (two triangles covering the full viewport)
@@ -625,17 +638,20 @@ export class CRTEmulator {
       gl.clearColor(0, 0, 0, 1);
       gl.clear(gl.COLOR_BUFFER_BIT);
 
+      const texW = SCREEN_W;
+      const texH = doubleScanlines ? SCREEN_H * 2 : SCREEN_H;
+
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, this.glTex);
       // Flip the texture vertically during unpack as WebGL coordinates start bottom-left
       gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, SCREEN_W, SCREEN_H * (doubleScanlines ? 2 : 1), 0, gl.RGBA, gl.UNSIGNED_BYTE, imageData.data);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, texW, texH, 0, gl.RGBA, gl.UNSIGNED_BYTE, imageData.data);
 
       gl.useProgram(this.glProgramCRT);
 
       gl.uniform1i(this.uniforms.uSampler, 0);
       gl.uniform2f(this.uniforms.uResolution, this.canvas.width, this.canvas.height);
-      gl.uniform2f(this.uniforms.uTextureResolution, SCREEN_W, SCREEN_H);
+      gl.uniform2f(this.uniforms.uTextureResolution, texW, texH);
 
       // Set CRT shader uniforms dynamically, merging with defaults
       const opt = customOptions ? { ...DEFAULT_OPTIONS, ...customOptions } : DEFAULT_OPTIONS;
@@ -654,8 +670,8 @@ export class CRTEmulator {
       gl.uniform1f(this.uniforms.uGapHeight, opt.gapHeight);
       gl.uniform1f(this.uniforms.uMaskFade, opt.maskFade);
 
-      const aPositionLoc = gl.getAttribLocation(this.glProgramCRT, "aPosition");
-      const aTexCoordLoc = gl.getAttribLocation(this.glProgramCRT, "aTexCoord");
+      const aPositionLoc = this.uniforms.aPosition;
+      const aTexCoordLoc = this.uniforms.aTexCoord;
 
       gl.enableVertexAttribArray(aPositionLoc);
       gl.enableVertexAttribArray(aTexCoordLoc);
@@ -718,7 +734,7 @@ export class CRTEmulator {
    }
 
    /**
-    * Cleans up observers and listeners to prevent memory leaks.
+    * Cleans up observers, listeners and WebGL resources to prevent memory leaks.
     */
    public destroy(): void {
       if (this.resizeObserver) {
@@ -728,6 +744,21 @@ export class CRTEmulator {
       if (this.resizeListener) {
          window.removeEventListener('resize', this.resizeListener);
          this.resizeListener = null;
+      }
+
+      const gl = this.gl;
+      if (gl && this.useWebGL) {
+         if (this.glTex) gl.deleteTexture(this.glTex);
+         if (this.glVertexBuffer) gl.deleteBuffer(this.glVertexBuffer);
+         if (this.glProgramCRT) gl.deleteProgram(this.glProgramCRT);
+         this.glTex = null;
+         this.glVertexBuffer = null;
+         this.glProgramCRT = null;
+         this.uniforms = null;
+         this.useWebGL = false;
+
+         const loseContext = gl.getExtension("WEBGL_lose_context");
+         if (loseContext) loseContext.loseContext();
       }
    }
 }
