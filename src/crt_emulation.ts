@@ -642,84 +642,6 @@ const fsPresentSource = fsLibSource + `
       uniform sampler2D uBloom;      // blurred bright pass (linear light)
       uniform float uBloomAmount;
 
-      // Shadow mask.
-      // uMaskType: 0 = slot (staggered slots), 1 = grille (vertical stripes),
-      // 2 = delta (triads with per-row rotating RGB order).
-      vec3 Mask(vec2 pos) {
-         pos = pos / uMaskScale;
-
-#ifdef HAS_DERIVATIVES
-         vec2 d = fwidth(pos);
-         float maxD = max(d.x / uMaskWidth, d.y / uMaskHeight);
-         float blend = smoothstep(0.3, 0.8, maxD);
-#else
-         float blend = 0.0;
-#endif
-
-         // Calculate average mask color
-         float activeArea = (uMaskWidth - uGapWidth) * (uMaskHeight - uGapHeight) / (uMaskWidth * uMaskHeight);
-         vec3 maskAvg = activeArea * vec3((uMaskLight + 2.0 * uMaskDark) / 3.0) + (1.0 - activeArea) * vec3(uMaskDark);
-
-         // Aperture grille: vertical stripes only, no row gaps, no stagger.
-         if (uMaskType == 1) {
-            float xModG = mod(pos.x, uMaskWidth);
-            float subW = (uMaskWidth - uGapWidth) / 3.0;
-            vec3 m = vec3(uMaskDark);
-            if (xModG < subW) {
-               m.r = uMaskLight;
-            } else if (xModG < 2.0 * subW) {
-               m.g = uMaskLight;
-            } else {
-               m.b = uMaskLight;
-            }
-            return mix(m, maskAvg, blend);
-         }
-
-         // Stagger every other column of the mask grid.
-         float col = floor(pos.x / uMaskWidth);
-         float y = pos.y + mod(col, 2.0) * (uMaskHeight / 2.0);
-
-         // Delta-gun: no full-width horizontal gap rows; the RGB order rotates
-         // every triad row so neighbouring rows are offset by one phosphor.
-         float rowIdx = floor(y / uMaskHeight);
-         float channelShift = (uMaskType == 2) ? mod(rowIdx, 3.0) : 0.0;
-
-         // Horizontal dark row gap (modulus check)
-         float yMod = mod(y, uMaskHeight);
-         if (uMaskType != 2 && yMod >= (uMaskHeight - uGapHeight)) {
-            return mix(vec3(uMaskDark), maskAvg, blend);
-         }
-
-         // Vertical dark column gap (modulus check)
-         float xMod = mod(pos.x, uMaskWidth);
-         if (xMod >= (uMaskWidth - uGapWidth)) {
-            return mix(vec3(uMaskDark), maskAvg, blend);
-         }
-
-         // Active triad subpixel calculation
-         float activeWidth = uMaskWidth - uGapWidth;
-         float subpixelWidth = activeWidth / 3.0;
-
-         vec3 mask = vec3(uMaskDark);
-         int slot;
-         if (xMod < subpixelWidth) {
-            slot = 0;
-         } else if (xMod < 2.0 * subpixelWidth) {
-            slot = 1;
-         } else {
-            slot = 2;
-         }
-         slot = int(mod(float(slot + int(channelShift)), 3.0));
-         if (slot == 0) {
-            mask.r = uMaskLight;
-         } else if (slot == 1) {
-            mask.g = uMaskLight;
-         } else {
-            mask.b = uMaskLight;
-         }
-         return mix(mask, maskAvg, blend);
-      }
-
       void main(void) {
          vec2 pos = Warp(vTexCoord);
 
@@ -888,7 +810,11 @@ export class CRTEmulator {
          };
 
          const vs = loadShader(gl.VERTEX_SHADER, vsSource);
-         const fragmentPrefix = hasDerivatives ? "#define HAS_DERIVATIVES 1\n" : "";
+         // In WebGL 1 fwidth needs both the JS extension AND the #extension
+         // directive; without the extension the mask falls back to constant.
+         const fragmentPrefix = hasDerivatives
+            ? "#extension GL_OES_standard_derivatives : enable\n#define HAS_DERIVATIVES 1\n"
+            : "";
          const fsCRT = loadShader(gl.FRAGMENT_SHADER, fragmentPrefix + fsCRTSource);
 
          if (!vs || !fsCRT) return false;
