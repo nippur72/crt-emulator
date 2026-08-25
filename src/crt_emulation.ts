@@ -495,8 +495,6 @@ const fsLibSource = `
       vec3 Mask(vec2 pos) {
          pos = pos / uMaskScale;
 
-         // Derivative-based moire detection (requires OES_standard_derivatives;
-         // without it the mask is rendered constant instead of failing to compile)
 #ifdef HAS_DERIVATIVES
          vec2 d = fwidth(pos);
          float maxD = max(d.x / uMaskWidth, d.y / uMaskHeight);
@@ -505,67 +503,74 @@ const fsLibSource = `
          float blend = 0.0;
 #endif
 
-         // Calculate average mask color
+         // Calculate average mask color (used when the grid falls below Nyquist)
          float activeArea = (uMaskWidth - uGapWidth) * (uMaskHeight - uGapHeight) / (uMaskWidth * uMaskHeight);
          vec3 maskAvg = activeArea * vec3((uMaskLight + 2.0 * uMaskDark) / 3.0) + (1.0 - activeArea) * vec3(uMaskDark);
 
-         // Aperture grille: vertical stripes only, no row gaps, no stagger.
-         if (uMaskType == 1) {
-            float xModG = mod(pos.x, uMaskWidth);
-            float subW = (uMaskWidth - uGapWidth) / 3.0;
-            vec3 m = vec3(uMaskDark);
-            if (xModG < subW) {
-               m.r = uMaskLight;
-            } else if (xModG < 2.0 * subW) {
-               m.g = uMaskLight;
-            } else {
-               m.b = uMaskLight;
-            }
-            return mix(m, maskAvg, blend);
-         }
-
-         // Stagger every other column of the mask grid.
+         // Stagger every other column of the mask grid (slot and delta only).
          float col = floor(pos.x / uMaskWidth);
-         float y = pos.y + mod(col, 2.0) * (uMaskHeight / 2.0);
+         float y = pos.y + (uMaskType != 1 ? mod(col, 2.0) * (uMaskHeight / 2.0) : 0.0);
 
-         // Delta-gun: no full-width horizontal gap rows; the RGB order rotates
-         // every triad row so neighbouring rows are offset by one phosphor.
+         // Delta-gun: the RGB order rotates every triad row.
          float rowIdx = floor(y / uMaskHeight);
          float channelShift = (uMaskType == 2) ? mod(rowIdx, 3.0) : 0.0;
 
-         // Horizontal dark row gap (modulus check)
-         float yMod = mod(y, uMaskHeight);
-         if (uMaskType != 2 && yMod >= (uMaskHeight - uGapHeight)) {
-            return mix(vec3(uMaskDark), maskAvg, blend);
-         }
-
-         // Vertical dark column gap (modulus check)
          float xMod = mod(pos.x, uMaskWidth);
-         if (xMod >= (uMaskWidth - uGapWidth)) {
-            return mix(vec3(uMaskDark), maskAvg, blend);
-         }
+         float yMod = mod(y, uMaskHeight);
 
-         // Active triad subpixel calculation
          float activeWidth = uMaskWidth - uGapWidth;
-         float subpixelWidth = activeWidth / 3.0;
+         float activeHeight = uMaskHeight - uGapHeight;
+         float subW = activeWidth / 3.0;
+         // Grille (aperture) stripes run to the cell edge with no right gap;
+         // slot/delta keep the dark column between triads.
+         bool hasGap = (uMaskType != 1);
+         float rightEdge = hasGap ? activeWidth : uMaskWidth;
 
-         vec3 mask = vec3(uMaskDark);
-         int slot;
-         if (xMod < subpixelWidth) {
-            slot = 0;
-         } else if (xMod < 2.0 * subpixelWidth) {
-            slot = 1;
-         } else {
-            slot = 2;
+         // Anti-aliasing half-widths, capped so they never blend away the
+         // narrow mesh gaps. Interior subpixel boundaries may soften more
+         // (they're wide colour transitions), but gap edges stay nearly crisp
+         // so the dark separation remains visible.
+#ifdef HAS_DERIVATIVES
+         float aaX   = max(min(d.x, 0.5 * subW), 1e-5);
+         float aaGap = max(min(d.x, 0.3 * uGapWidth), 1e-5);
+         float aaY   = max(min(d.y, 0.3 * uGapHeight), 1e-5);
+#else
+         float aaX   = 0.4 * subW;
+         float aaGap = 0.3 * uGapWidth;
+         float aaY   = 0.3 * uGapHeight;
+#endif
+
+         // Anti-aliased coverage of each subpixel span along x.
+         float covL = (hasGap ? smoothstep(0.0, aaGap, xMod) : 1.0)
+                    * (1.0 - smoothstep(subW - aaX, subW + aaX, xMod));
+         float covM = smoothstep(subW - aaX, subW + aaX, xMod)
+                    * (1.0 - smoothstep(2.0 * subW - aaX, 2.0 * subW + aaX, xMod));
+         float covR = smoothstep(2.0 * subW - aaX, 2.0 * subW + aaX, xMod)
+                    * (hasGap ? (1.0 - smoothstep(rightEdge - aaGap, rightEdge + aaGap, xMod)) : 1.0);
+
+         // Route each span's coverage to the colour channel it excites.
+         vec3 chan = vec3(0.0);
+         float s0 = channelShift;
+         if (s0 < 0.5) chan.r += covL;
+         else if (s0 < 1.5) chan.g += covL;
+         else chan.b += covL;
+         float s1 = mod(channelShift + 1.0, 3.0);
+         if (s1 < 0.5) chan.r += covM;
+         else if (s1 < 1.5) chan.g += covM;
+         else chan.b += covM;
+         float s2 = mod(channelShift + 2.0, 3.0);
+         if (s2 < 0.5) chan.r += covR;
+         else if (s2 < 1.5) chan.g += covR;
+         else chan.b += covR;
+
+         vec3 mask = mix(vec3(uMaskDark), vec3(uMaskLight), chan);
+
+         // Slot-only horizontal dark row gap, softly crossed at its boundary.
+         if (uMaskType != 1 && uMaskType != 2) {
+            float rowOn = 1.0 - smoothstep(activeHeight - aaY, activeHeight + aaY, yMod);
+            mask *= rowOn;
          }
-         slot = int(mod(float(slot + int(channelShift)), 3.0));
-         if (slot == 0) {
-            mask.r = uMaskLight;
-         } else if (slot == 1) {
-            mask.g = uMaskLight;
-         } else {
-            mask.b = uMaskLight;
-         }
+
          return mix(mask, maskAvg, blend);
       }
    `;
