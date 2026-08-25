@@ -134,11 +134,13 @@ export interface CRTEmulatorOptions {
    convergence?: number;
 
    /**
-    * Vignette strength (0.0 - 1.0).
-    * Darkens the screen corners like a real tube's edge falloff.
-    * @default 0.0
+    * Corner radius of the screen glass, as a fraction of the screen's
+    * shorter edge (0.0 - 0.5). Rounds the corners of the displayed image to
+    * mimic the rounded corners of an old CRT tube; the outside is darkened
+    * to black. 0 disables the rounding.
+    * @default 0.08
     */
-   vignette?: number;
+   cornerRadius?: number;
 
    /**
     * Horizontal sync jitter amplitude, in output pixels.
@@ -198,7 +200,7 @@ export const DEFAULT_OPTIONS: Required<CRTEmulatorOptions> = {
    gapHeight: 0.5,
    maskFade: 0.9,
    convergence: 0.0,
-   vignette: 0.0,
+   cornerRadius: 0.08,
    jitter: 0.0,
    maskType: "slot",
    persistence: 0.0,
@@ -228,7 +230,7 @@ interface CRTEmulatorUniforms {
    uGapHeight: WebGLUniformLocation | null;
    uMaskFade: WebGLUniformLocation | null;
    uConvergence: WebGLUniformLocation | null;
-   uVignette: WebGLUniformLocation | null;
+   uCornerRadius: WebGLUniformLocation | null;
    uJitter: WebGLUniformLocation | null;
    uTime: WebGLUniformLocation | null;
    uMaskType: WebGLUniformLocation | null;
@@ -262,7 +264,7 @@ const fsLibSource = `
       uniform float uGapHeight;
       uniform float uMaskFade;
       uniform float uConvergence;
-      uniform float uVignette;
+      uniform float uCornerRadius;
       uniform float uJitter;
       uniform float uTime;
       uniform int uMaskType;
@@ -460,6 +462,25 @@ const fsLibSource = `
          return pos * 0.5 + 0.5;
       }
 
+      // 1 inside the rounded CRT screen glass, 0 outside the corner radius.
+      // Darkens the outside corners to black, mimicking an old curved tube.
+      float CornerShade(vec2 pos) {
+         vec2 aspect = uResolution / min(uResolution.x, uResolution.y);
+         vec2 p = (pos * 2.0 - 1.0) * aspect;
+         float r = uCornerRadius * 2.0;
+         if (r <= 0.0) return 1.0;
+         // Signed distance to a rounded rectangle with half-size = aspect
+         // and corner radius r (short edge spans -1..1, i.e. length 2).
+         vec2 q = abs(p) - aspect + r;
+         float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+#ifdef HAS_DERIVATIVES
+         float aa = fwidth(d);
+#else
+         float aa = 0.015;
+#endif
+         return 1.0 - smoothstep(-aa, aa, d);
+      }
+
       // 1D hash for per-scanline jitter (sin-free, stable across GPUs).
       float hash11(float p) {
          p = fract(p * 0.1031);
@@ -592,11 +613,8 @@ const fsCRTSource = fsLibSource + `
 
          vec3 color = rawColor * dynamicMask;
 
-         // Corner falloff (vignette)
-         if (uVignette > 0.0) {
-            float r2 = length((pos - 0.5) * vec2(1.25, 1.0)) * 1.4;
-            color *= 1.0 - uVignette * pow(clamp(r2, 0.0, 1.0), 2.5);
-         }
+         // Rounded CRT glass corners: darken outside the radius.
+         color *= CornerShade(pos);
 
          gl_FragColor = vec4(ToSrgb(color), 1.0);
       }
@@ -604,7 +622,7 @@ const fsCRTSource = fsLibSource + `
 
 /**
  * Multipass "scene" program: everything up to and including the composite
- * chroma path, output in linear light WITHOUT mask/vignette/gamma.
+ * chroma path, output in linear light WITHOUT mask/corner/gamma.
  */
 const fsSceneSource = fsLibSource + `
       void main(void) {
@@ -635,7 +653,7 @@ const fsSceneSource = fsLibSource + `
    `;
 
 /**
- * Multipass "present" program: mask + vignette + bloom add + gamma encode.
+ * Multipass "present" program: mask + rounded corners + bloom add + gamma encode.
  */
 const fsPresentSource = fsLibSource + `
       uniform sampler2D uScene;      // linear-light scene (post-chroma)
@@ -655,10 +673,9 @@ const fsPresentSource = fsLibSource + `
          vec3 dynamicMask = mix(maskVal, vec3(1.0), luma * uMaskFade);
          vec3 color = rawColor * dynamicMask;
 
-         if (uVignette > 0.0) {
-            float r2 = length((pos - 0.5) * vec2(1.25, 1.0)) * 1.4;
-            color *= 1.0 - uVignette * pow(clamp(r2, 0.0, 1.0), 2.5);
-         }
+         // Rounded CRT glass corners: darken outside the radius.
+         color *= CornerShade(pos);
+
          gl_FragColor = vec4(ToSrgb(color), 1.0);
       }
    `;
@@ -873,7 +890,7 @@ export class CRTEmulator {
             uGapHeight: gl.getUniformLocation(this.glProgramCRT, "uGapHeight"),
             uMaskFade: gl.getUniformLocation(this.glProgramCRT, "uMaskFade"),
             uConvergence: gl.getUniformLocation(this.glProgramCRT, "uConvergence"),
-            uVignette: gl.getUniformLocation(this.glProgramCRT, "uVignette"),
+            uCornerRadius: gl.getUniformLocation(this.glProgramCRT, "uCornerRadius"),
             uJitter: gl.getUniformLocation(this.glProgramCRT, "uJitter"),
             uTime: gl.getUniformLocation(this.glProgramCRT, "uTime"),
             uMaskType: gl.getUniformLocation(this.glProgramCRT, "uMaskType"),
@@ -911,7 +928,7 @@ export class CRTEmulator {
             uGapWidth: loc(this.progPresent, "uGapWidth"),
             uGapHeight: loc(this.progPresent, "uGapHeight"),
             uMaskFade: loc(this.progPresent, "uMaskFade"),
-            uVignette: loc(this.progPresent, "uVignette"),
+            uCornerRadius: loc(this.progPresent, "uCornerRadius"),
             uWarpUnused: loc(this.progPresent, "uWarp"),
          };
          this.uAccum = {
@@ -1019,7 +1036,7 @@ export class CRTEmulator {
       gl.uniform1f(this.uniforms.uGapHeight, opt.gapHeight);
       gl.uniform1f(this.uniforms.uMaskFade, opt.maskFade);
       gl.uniform1f(this.uniforms.uConvergence, opt.convergence);
-      gl.uniform1f(this.uniforms.uVignette, opt.vignette);
+      gl.uniform1f(this.uniforms.uCornerRadius, opt.cornerRadius);
       gl.uniform1f(this.uniforms.uJitter, opt.jitter);
       gl.uniform1f(this.uniforms.uTime, performance.now() / 1000);
       const maskTypeIndex = opt.maskType === "grille" ? 1 : (opt.maskType === "delta" ? 2 : 0);
@@ -1171,7 +1188,7 @@ export class CRTEmulator {
       gl.uniform1f(this.uPresent.uGapWidth!, opt.gapWidth);
       gl.uniform1f(this.uPresent.uGapHeight!, opt.gapHeight);
       gl.uniform1f(this.uPresent.uMaskFade!, opt.maskFade);
-      gl.uniform1f(this.uPresent.uVignette!, opt.vignette);
+      gl.uniform1f(this.uPresent.uCornerRadius!, opt.cornerRadius);
       const maskTypeIndex2 = opt.maskType === "grille" ? 1 : (opt.maskType === "delta" ? 2 : 0);
       gl.uniform1i(this.uPresent.uMaskType!, maskTypeIndex2);
       gl.drawArrays(gl.TRIANGLES, 0, 6);

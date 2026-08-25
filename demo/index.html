@@ -7,10 +7,7 @@
   body { background:#151515; color:#ccc; font-family: ui-monospace, monospace; margin:20px; }
   h3 { margin: 0 0 8px 0; }
   canvas { display:block; border:1px solid #333; }
-  #controls { margin-top:12px; line-height:1.9; }
-  #controls label { display:inline-block; width:150px; }
-  #controls input[type=range] { vertical-align:middle; width:200px; }
-  #controls input[type=checkbox] { vertical-align:middle; }
+  #controls { margin-top:12px; }
   code { background:#222; padding:1px 5px; border-radius:3px; }
   #pastezone {
     margin-top:12px; padding:8px 12px; border:1px dashed #555; background:#1b1b1b;
@@ -28,27 +25,7 @@
 <h3>CRT emulator — composite chroma demo (C64-like 320&#215;200)</h3>
 <canvas id="screen" width="960" height="600"></canvas>
 <div id="controls">
-  <div><label>chromaBleed</label><input id="bleed" type="range" min="0" max="4" step="0.1" value="2"><span id="bleedv"></span></div>
-  <div><label>chromaPhase</label><input id="phase" type="range" min="0" max="1" step="0.01" value="0.5"><span id="phasev"></span> (0.5 = NTSC, 0.625 = PAL)</div>
-  <div><label>chromaCrosstalk</label><input id="xtalk" type="range" min="0" max="1" step="0.05" value="0.5"><span id="xtalkv"></span></div>
-  <div><label>maskScale</label><input id="mask" type="range" min="0.5" max="3" step="0.05" value="1.25"><span id="maskv"></span></div>
-  <div><label>warp</label><input id="warp" type="range" min="0" max="0.12" step="0.005" value="0.04"><span id="warpv"></span></div>
-  <div><label>convergence</label><input id="conv" type="range" min="0" max="3" step="0.05" value="0"><span id="convv"></span></div>
-  <div><label>vignette</label><input id="vig" type="range" min="0" max="1" step="0.01" value="0"><span id="vigv"></span></div>
-  <div><label>jitter</label><input id="jit" type="range" min="0" max="3" step="0.05" value="0"><span id="jitv"></span></div>
-  <div><label>persistence</label><input id="pers" type="range" min="0" max="0.95" step="0.01" value="0"><span id="persv"></span></div>
-  <div><label>bloom</label><input id="bloom" type="range" min="0" max="1" step="0.01" value="0"><span id="bloomv"></span></div>
-  <div><label>maskType</label>
-    <select id="mtype">
-      <option value="slot">slot</option>
-      <option value="grille">grille</option>
-      <option value="delta">delta</option>
-    </select>
-  </div>
-  <div><label><input id="double" type="checkbox"> double scanlines</label></div>
-  <div style="margin-top:8px;">
-    <button id="open-window-btn" type="button" style="background:#3a3a4c; color:#eee; border:1px solid #666; padding:5px 12px; border-radius:4px; cursor:pointer; font-family:inherit;">Open CRT Parameters Window (window.crt_emulator())</button>
-  </div>
+  <button id="open-window-btn" type="button" style="background:#3a3a4c; color:#eee; border:1px solid #666; padding:5px 12px; border-radius:4px; cursor:pointer; font-family:inherit;">Open CRT Parameters Window (window.crt_emulator())</button>
 </div>
 <div id="pastezone" title="Focus this page and press Ctrl+V">
   <span id="pastesrc">Click the page and press Ctrl+V to paste a screen copied from an emulator</span>
@@ -156,84 +133,25 @@ function resetFrame() {
 }
 document.getElementById("reset").addEventListener("click", resetFrame);
 
-// --- optionally double rows (matching the emulator's doubleScanlines) -------
-function doubled(img) {
-  const w = img.width, h = img.height;
-  const d = new ImageData(w, h * 2);
-  for (let y = 0; y < h * 2; y++) {
-    d.data.set(img.data.subarray((y >> 1) * w * 4, ((y >> 1) + 1) * w * 4), y * w * 4);
-  }
-  return d;
-}
-
 // --- set up the emulator ----------------------------------------------------
 const crt = new CRTEmulator(canvas);
 crt.init();
 
-const el = (id) => document.getElementById(id);
-const labels = { bleed: "bleedv", phase: "phasev", xtalk: "xtalkv", mask: "maskv", warp: "warpv", conv: "convv", vig: "vigv", jit: "jitv", pers: "persv", bloom: "bloomv" };
-for (const [id, span] of Object.entries(labels)) {
-  el(span).textContent = el(id).value;
-  el(id).addEventListener("input", () => {
-    el(span).textContent = el(id).value;
-    if (activeGuiHandle) {
-      activeGuiHandle.setOptions(getCurrentPageOpts());
-    }
-  });
-}
+let currentCustomOptions = {};
 
-function getCurrentPageOpts() {
-  return {
-    chromaBleed: parseFloat(el("bleed").value),
-    chromaPhase: parseFloat(el("phase").value),
-    chromaCrosstalk: parseFloat(el("xtalk").value),
-    maskScale: parseFloat(el("mask").value),
-    warp: parseFloat(el("warp").value),
-    convergence: parseFloat(el("conv").value),
-    vignette: parseFloat(el("vig").value),
-    jitter: parseFloat(el("jit").value),
-    persistence: parseFloat(el("pers").value),
-    bloom: parseFloat(el("bloom").value),
-    maskType: el("mtype").value,
-  };
-}
-
-let activeGuiHandle = null;
-let currentCustomOptions = getCurrentPageOpts();
-
+// Keep the options in sync when the popup window pushes changes.
 window.addEventListener("crt-emulator:change", (e) => {
   currentCustomOptions = e.detail;
-  // Update on-page sliders if they exist
-  const syncNum = (key, id, spanId) => {
-    if (e.detail[key] !== undefined && el(id)) {
-      el(id).value = e.detail[key];
-      el(spanId).textContent = e.detail[key];
-    }
-  };
-  syncNum("chromaBleed", "bleed", "bleedv");
-  syncNum("chromaPhase", "phase", "phasev");
-  syncNum("chromaCrosstalk", "xtalk", "xtalkv");
-  syncNum("maskScale", "mask", "maskv");
-  syncNum("warp", "warp", "warpv");
-  syncNum("convergence", "conv", "convv");
-  syncNum("vignette", "vig", "vigv");
-  syncNum("jitter", "jit", "jitv");
-  syncNum("persistence", "pers", "persv");
-  syncNum("bloom", "bloom", "bloomv");
-  if (e.detail.maskType !== undefined && el("mtype")) {
-    el("mtype").value = e.detail.maskType;
-  }
 });
 
 document.getElementById("open-window-btn").addEventListener("click", () => {
-  activeGuiHandle = window.crt_emulator(currentCustomOptions, (opts) => {
+  window.crt_emulator(currentCustomOptions, (opts) => {
     currentCustomOptions = opts;
   });
 });
 
 function frame() {
-  const img = el("double").checked ? doubled(cur.img) : cur.img;
-  crt.render(cur.w, cur.h, el("double").checked, img, currentCustomOptions);
+  crt.render(cur.w, cur.h, false, cur.img, currentCustomOptions);
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
